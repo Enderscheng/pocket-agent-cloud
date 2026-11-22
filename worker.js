@@ -70,7 +70,8 @@ function reply(body, status = 200, headers = {}) {
   return new Response(body, { status, headers: {
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-store",
-    "Referrer-Policy": "no-referrer",
+    // Keep Origin on same-site form POSTs; suppress referrers to other sites.
+    "Referrer-Policy": "same-origin",
     "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://accounts.google.com; base-uri 'none'; frame-ancestors 'none'",
     ...headers,
