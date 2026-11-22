@@ -90,9 +90,20 @@ function origin(env) {
   } catch { throw new SetupError("Set BASE_URL to the HTTPS address of this Worker, with no path.", 503); }
 }
 function requireConfig(env) {
-  if (!env.DB || !env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.ALLOWED_EMAIL ||
-    env.ADMIN_TOKEN?.length < 32 || !env.ADMIN_TOKEN || env.ENCRYPTION_KEY?.length < 32 || !env.ENCRYPTION_KEY) {
-    throw new SetupError("The server is online. Complete the database and configuration steps in the setup guide before connecting Google.", 503);
+  const problems = [];
+  if (!env.DB) problems.push("DB: missing D1 database binding");
+  else if (typeof env.DB.prepare !== "function" || typeof env.DB.withSession !== "function")
+    problems.push("DB: must be a D1 database binding, not a text variable");
+  for (const name of ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "ALLOWED_EMAIL"]) {
+    if (typeof env[name] !== "string" || !env[name].trim()) problems.push(`${name}: missing or empty`);
+  }
+  for (const name of ["ADMIN_TOKEN", "ENCRYPTION_KEY"]) {
+    if (typeof env[name] !== "string" || !env[name].trim()) problems.push(`${name}: missing or empty`);
+    else if (env[name].trim().length < 32) problems.push(`${name}: must contain at least 32 characters`);
+  }
+  if (problems.length) {
+    // Only fixed setting names and validation reasons are shown, never values.
+    throw new SetupError(`Configuration check: ${problems.join("; ")}. Update the production Worker's settings, then deploy and reload this page.`, 503);
   }
   origin(env);
   try { new Intl.DateTimeFormat("en", { timeZone: env.CALENDAR_TIME_ZONE || "Europe/Copenhagen" }); }
