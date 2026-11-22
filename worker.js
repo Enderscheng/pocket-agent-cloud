@@ -1,4 +1,5 @@
-// Calendar setup only. No public event-writing or AI endpoints are enabled.
+// Calendar setup and paired, chat-only voice conversations. No event-writing tools.
+import { pairVoice, voiceChat } from "./voice.js";
 const CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.app.created";
 const SCOPES = `openid email ${CALENDAR_SCOPE}`;
 const COOKIE = "__Host-pocket-admin";
@@ -158,14 +159,15 @@ async function accessToken(env, link) {
 
 async function handle(request, env) {
   const url = new URL(request.url);
+  if (url.pathname === "/api/chat") return voiceChat(request, env);
   if (request.method === "GET" && url.pathname === "/health")
-    return reply(JSON.stringify({ service: "pocket-agent", stage: "calendar-setup", online: true }), 200,
+    return reply(JSON.stringify({ service: "pocket-agent", stage: "voice-chat", online: true }), 200,
       { "Content-Type": "application/json" });
   if (request.method === "GET" && url.pathname === "/") {
-    return page("Pocket Agent is online", "<p>Your cloud service is running.</p><p><a href='/admin'>Open calendar setup</a></p><p>This version connects Google and creates your Agent calendar. Voice commands and notes are not connected yet.</p>");
+    return page("Pocket Agent is online", "<p>Your cloud service is running.</p><p><a href='/admin'>Open calendar setup</a></p><p>Voice chat is available after phone pairing. Calendar event commands and Obsidian delivery are not connected yet.</p>");
   }
   const routes = { "/admin": "GET", "/admin/login": "POST", "/admin/logout": "POST",
-    "/oauth/start": "POST", "/oauth/callback": "GET", "/admin/create-calendar": "POST" };
+    "/oauth/start": "POST", "/oauth/callback": "GET", "/admin/create-calendar": "POST", "/admin/pair-voice": "POST" };
   if (!routes[url.pathname]) return page("Not found", "<p>This endpoint is not available.</p>", 404);
   if (request.method !== routes[url.pathname]) return reply("Method not allowed", 405, { Allow: routes[url.pathname] });
   requireConfig(env);
@@ -183,6 +185,12 @@ async function handle(request, env) {
   }
   // Use the primary for the OAuth and calendar state, including read-after-write.
   const db = env.DB.withSession("first-primary");
+  if (url.pathname === "/admin/pair-voice") {
+    await form(request, env, admin);
+    if (typeof env.AI?.run !== "function") throw new SetupError("Workers AI binding AI is missing. Wait for the voice-chat deployment to finish.", 503);
+    const key = await pairVoice(db);
+    return page("Pair voice chat", `<p>Copy this voice key into Pocket Agent → 設定. It is shown only now. It replaces the previous phone key.</p><textarea readonly rows="3" style="width:100%;box-sizing:border-box;font:16px monospace" aria-label="Voice key">${escape(key)}</textarea><p>This key allows chat only. It cannot sign in to setup, read Google Calendar, change events or access Obsidian.</p><p>Keep it private. If lost, create another key here.</p><p><a href='/admin'>Return to setup</a></p>`);
+  }
   if (url.pathname === "/admin") {
     const link = await db.prepare("SELECT * FROM integration WHERE id = 1").first();
     let state = "<p>Google is not connected yet.</p>";
@@ -193,7 +201,7 @@ async function handle(request, env) {
         state += "<p>Calendar creation needs checking. Look in Google Calendar for an Agent calendar before retrying; this service will not create another automatically.</p>";
       else state += `<form method='post' action='/admin/create-calendar'>${csrf(admin)}<p>Create one empty calendar named <strong>Agent</strong>.</p><button>Create Agent calendar</button></form>`;
     }
-    return page("Calendar setup", `${state}<form method='post' action='/oauth/start'>${csrf(admin)}<button>${link ? "Reconnect" : "Connect"} Google</button></form><p>Google access is limited to calendars created by this integration. No existing personal or university calendar access is requested.</p><form method='post' action='/admin/logout'>${csrf(admin)}<button>Sign out of setup</button></form>`);
+    return page("Calendar setup", `${state}<h2>Voice chat</h2><p>Talk in Cantonese with Pocket Agent. This version can discuss and draft; it cannot save notes, change calendars or set reminders.</p><form method='post' action='/admin/pair-voice'>${csrf(admin)}<button>Create voice key</button></form><p>Creating a key replaces the previous phone key. The iPhone stores it in Keychain.</p><form method='post' action='/oauth/start'>${csrf(admin)}<button>${link ? "Reconnect" : "Connect"} Google</button></form><p>Google access is limited to calendars created by this integration. No existing personal or university calendar access is requested.</p><form method='post' action='/admin/logout'>${csrf(admin)}<button>Sign out of setup</button></form>`);
   }
   if (url.pathname === "/admin/logout") {
     await form(request, env, admin);

@@ -18,5 +18,8 @@
       "database_name": "pocket-agent-db",
       "database_id": "3381763b-3ffb-4fe1-887c-668d30c2d761"
     }
-  ]
+  ],
+  "ai": {
+    "binding": "AI"
+  }
 }
