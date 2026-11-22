@@ -5,4 +5,5 @@
   "compatibility_date": "2026-11-21",
   "workers_dev": true,
   "observability": { "enabled": false }
+  "database_id": "3381763b-3ffb-4fe1-887c-668d30c2d761"
 }
