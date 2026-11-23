@@ -1,5 +1,7 @@
 # Pocket Agent cloud: calendar setup and voice chat
 
+Version 0.3 adds an owner-only Discord `/ask` command answered by Google Gemini. See [DISCORD-SETUP.md](DISCORD-SETUP.md).
+
 Version 0.2 adds Cantonese voice conversation through the updated iPhone app and Cloudflare Workers AI. Follow [VOICE-SETUP.md](VOICE-SETUP.md) to install and pair. Calendar event actions, reminders, and Obsidian delivery are not implemented yet. The cloud service works independently of your laptop. The original Google/calendar setup instructions follow.
 
 ## A. Deploy the service

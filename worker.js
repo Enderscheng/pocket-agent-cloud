@@ -1,5 +1,6 @@
-// Calendar setup and paired, chat-only voice conversations. No event-writing tools.
+// Calendar setup, paired chat-only voice conversations and owner-only Discord /ask. No event-writing tools.
 import { pairVoice, voiceChat } from "./voice.js";
+import { discordInteraction, registerCommands, missingDiscordSettings, DiscordError } from "./discord.js";
 const CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.app.created";
 const SCOPES = `openid email ${CALENDAR_SCOPE}`;
 const COOKIE = "__Host-pocket-admin";
@@ -157,17 +158,24 @@ async function accessToken(env, link) {
   return data.access_token;
 }
 
-async function handle(request, env) {
+function discordStatus(env, admin) {
+  const missing = missingDiscordSettings(env);
+  const endpoint = `${origin(env)}/discord`;
+  const note = missing.length ? `<p>Missing in Cloudflare: <code>${escape(missing.join(", "))}</code></p>` : "<p>All Discord and Gemini settings are present.</p>";
+  return `${note}<p>Interactions Endpoint URL for the Discord Developer Portal: <code>${escape(endpoint)}</code></p><form method='post' action='/admin/register-discord'>${csrf(admin)}<button>Register Discord commands</button></form>`;
+}
+async function handle(request, env, ctx) {
   const url = new URL(request.url);
   if (url.pathname === "/api/chat") return voiceChat(request, env);
+  if (url.pathname === "/discord") return discordInteraction(request, env, ctx);
   if (request.method === "GET" && url.pathname === "/health")
-    return reply(JSON.stringify({ service: "pocket-agent", stage: "voice-chat", online: true }), 200,
+    return reply(JSON.stringify({ service: "pocket-agent", stage: "discord-gemini", online: true }), 200,
       { "Content-Type": "application/json" });
   if (request.method === "GET" && url.pathname === "/") {
     return page("Pocket Agent is online", "<p>Your cloud service is running.</p><p><a href='/admin'>Open calendar setup</a></p><p>Voice chat is available after phone pairing. Calendar event commands and Obsidian delivery are not connected yet.</p>");
   }
   const routes = { "/admin": "GET", "/admin/login": "POST", "/admin/logout": "POST",
-    "/oauth/start": "POST", "/oauth/callback": "GET", "/admin/create-calendar": "POST", "/admin/pair-voice": "POST" };
+    "/oauth/start": "POST", "/oauth/callback": "GET", "/admin/create-calendar": "POST", "/admin/pair-voice": "POST", "/admin/register-discord": "POST" };
   if (!routes[url.pathname]) return page("Not found", "<p>This endpoint is not available.</p>", 404);
   if (request.method !== routes[url.pathname]) return reply("Method not allowed", 405, { Allow: routes[url.pathname] });
   requireConfig(env);
@@ -191,6 +199,13 @@ async function handle(request, env) {
     const key = await pairVoice(db);
     return page("Pair voice chat", `<p>Copy this voice key into Pocket Agent → 設定. It is shown only now. It replaces the previous phone key.</p><textarea readonly rows="3" style="width:100%;box-sizing:border-box;font:16px monospace" aria-label="Voice key">${escape(key)}</textarea><p>This key allows chat only. It cannot sign in to setup, read Google Calendar, change events or access Obsidian.</p><p>Keep it private. If lost, create another key here.</p><p><a href='/admin'>Return to setup</a></p>`);
   }
+  if (url.pathname === "/admin/register-discord") {
+    await form(request, env, admin);
+    let names;
+    try { names = await registerCommands(env); }
+    catch (error) { if (error instanceof DiscordError) throw new SetupError(error.message, error.status); throw error; }
+    return page("Discord commands registered", `<p>Registered ${escape(names.join(", "))}. In your Discord server, type <code>/ask</code> to try it. New commands can take a minute to appear; restart Discord if they don't.</p><p><a href='/admin'>Return to setup</a></p>`);
+  }
   if (url.pathname === "/admin") {
     const link = await db.prepare("SELECT * FROM integration WHERE id = 1").first();
     let state = "<p>Google is not connected yet.</p>";
@@ -201,7 +216,7 @@ async function handle(request, env) {
         state += "<p>Calendar creation needs checking. Look in Google Calendar for an Agent calendar before retrying; this service will not create another automatically.</p>";
       else state += `<form method='post' action='/admin/create-calendar'>${csrf(admin)}<p>Create one empty calendar named <strong>Agent</strong>.</p><button>Create Agent calendar</button></form>`;
     }
-    return page("Calendar setup", `${state}<h2>Voice chat</h2><p>Talk in Cantonese with Pocket Agent. This version can discuss and draft; it cannot save notes, change calendars or set reminders.</p><form method='post' action='/admin/pair-voice'>${csrf(admin)}<button>Create voice key</button></form><p>Creating a key replaces the previous phone key. The iPhone stores it in Keychain.</p><form method='post' action='/oauth/start'>${csrf(admin)}<button>${link ? "Reconnect" : "Connect"} Google</button></form><p>Google access is limited to calendars created by this integration. No existing personal or university calendar access is requested.</p><form method='post' action='/admin/logout'>${csrf(admin)}<button>Sign out of setup</button></form>`);
+    return page("Calendar setup", `${state}<h2>Voice chat</h2><p>Talk in Cantonese with Pocket Agent. This version can discuss and draft; it cannot save notes, change calendars or set reminders.</p><form method='post' action='/admin/pair-voice'>${csrf(admin)}<button>Create voice key</button></form><p>Creating a key replaces the previous phone key. The iPhone stores it in Keychain.</p><h2>Discord</h2>${discordStatus(env, admin)}<h2>Google</h2><form method='post' action='/oauth/start'>${csrf(admin)}<button>${link ? "Reconnect" : "Connect"} Google</button></form><p>Google access is limited to calendars created by this integration. No existing personal or university calendar access is requested.</p><form method='post' action='/admin/logout'>${csrf(admin)}<button>Sign out of setup</button></form>`);
   }
   if (url.pathname === "/admin/logout") {
     await form(request, env, admin);
@@ -282,8 +297,8 @@ async function handle(request, env) {
 }
 
 export default {
-  async fetch(request, env) {
-    try { return await handle(request, env); }
+  async fetch(request, env, ctx) {
+    try { return await handle(request, env, ctx); }
     catch (error) {
       // Do not log requests, callback URLs, authorization codes, or secrets.
       if (error instanceof SetupError) return page("Setup needs attention", `<p>${escape(error.message)}</p><p><a href='/admin'>Return to setup</a></p>`, error.status);
