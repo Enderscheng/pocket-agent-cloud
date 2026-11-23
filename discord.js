@@ -1,4 +1,5 @@
-// Discord slash commands for the owner only: /ask sends one question to Gemini.
+// Discord slash commands for the owner only: /ask sends one question to Gemini,
+// /model picks the Gemini model and /usage shows today's request counts.
 // No calendar, Google account, notes or voice-key access is reachable from here.
 import { answerText } from './voice.js';
 const API = 'https://discord.com/api/v10';
@@ -16,7 +17,21 @@ export const COMMANDS = [{
     { type: 3, name: 'question', description: 'What do you want to ask?', required: true, max_length: 1500 },
     { type: 5, name: 'web', description: 'Let Gemini search the web with Google first', required: false },
   ],
+}, {
+  name: 'model', type: 1, description: 'See or change the Gemini model /ask uses',
+  options: [
+    { type: 1, name: 'show', description: 'Show which models /ask uses now' },
+    { type: 1, name: 'list', description: 'List the Gemini models your key can use' },
+    { type: 1, name: 'set', description: 'Change the model /ask uses', options: [
+      { type: 3, name: 'name', description: 'Model name, e.g. gemini-flash-latest', required: true, autocomplete: true, max_length: 60 },
+      { type: 5, name: 'backup', description: 'Change the backup model instead of the main one', required: false },
+    ] },
+    { type: 1, name: 'reset', description: 'Go back to the default models' },
+  ],
+}, {
+  name: 'usage', type: 1, description: 'Show how many AI requests Pocket Agent made today',
 }];
+const LIMITS_URL = 'https://aistudio.google.com/usage';
 
 class DiscordError extends Error {
   constructor(message, status = 400) { super(message); this.status = status; }
@@ -86,10 +101,61 @@ const BUSY_STATUS = new Set([500, 502, 503, 504]);
 // Temporary trouble (overload, rate limit, timeout): worth trying another model.
 class BusyError extends DiscordError {}
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-function modelName(value, fallback) {
-  const model = (value || fallback).trim();
-  if (!/^[a-z0-9.\-]{3,60}$/.test(model)) throw new DiscordError('GEMINI_MODEL or GEMINI_FALLBACK_MODEL is not a valid model name.');
+function modelName(value) {
+  const model = String(value || '').trim();
+  if (!/^[a-z0-9.\-]{3,60}$/.test(model)) throw new DiscordError('The saved Gemini model name is not valid. Use /model reset.');
   return model;
+}
+
+// ---- Saved model choice and usage counts (D1) ----
+const SETTINGS_TABLE = 'CREATE TABLE IF NOT EXISTS discord_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)';
+const USAGE_TABLE = 'CREATE TABLE IF NOT EXISTS ai_usage (day TEXT NOT NULL, model TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, limited INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, model))';
+function database(env) { return typeof env.DB?.withSession === 'function' ? env.DB.withSession('first-primary') : null; }
+const today = () => new Date().toISOString().slice(0, 10);
+// Discord setting wins over the Cloudflare variable, which wins over the default.
+export async function currentModels(env) {
+  let saved = {};
+  const db = database(env);
+  if (db) {
+    try {
+      const rows = (await db.prepare("SELECT key, value FROM discord_settings WHERE key IN ('model', 'backup')").all()).results || [];
+      saved = Object.fromEntries(rows.map(row => [row.key, row.value]));
+    } catch { /* Table not created yet: re-register commands. Use defaults meanwhile. */ }
+  }
+  const pick = (stored, variable, fallback) => stored ? [stored, 'set in Discord']
+    : (variable || '').trim() ? [variable.trim(), 'Cloudflare variable'] : [fallback, 'default'];
+  const [main, mainSource] = pick(saved.model, env.GEMINI_MODEL, DEFAULT_GEMINI_MODEL);
+  const [backup, backupSource] = pick(saved.backup, env.GEMINI_FALLBACK_MODEL, DEFAULT_FALLBACK_MODEL);
+  return { main: modelName(main), mainSource, backup: modelName(backup), backupSource };
+}
+async function recordUsage(env, model, limited = false) {
+  const db = database(env);
+  if (!db) return;
+  try {
+    await db.prepare('INSERT INTO ai_usage (day, model, requests, limited) VALUES (?, ?, 1, ?) ON CONFLICT(day, model) DO UPDATE SET requests = requests + 1, limited = limited + excluded.limited')
+      .bind(today(), model, limited ? 1 : 0).run();
+  } catch { /* Counting is best effort and must never block an answer. */ }
+}
+let modelCache = { at: 0, models: [] };
+// Text-chat Gemini models this key can call. Google's list does not include remaining quota.
+export async function listModels(env, timeout = 5000) {
+  if (Date.now() - modelCache.at < 600000 && modelCache.models.length) return modelCache.models;
+  let response;
+  try {
+    response = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000', {
+      signal: AbortSignal.timeout(timeout), headers: { 'x-goog-api-key': env.GEMINI_API_KEY.trim() } });
+  } catch { throw new DiscordError('Google did not answer in time. Try again.'); }
+  if (!response.ok) throw new DiscordError(`Google returned HTTP ${response.status} for the model list. Check GEMINI_API_KEY.`);
+  const data = await response.json();
+  const models = (data.models || [])
+    .filter(m => typeof m.name === 'string' && m.name.startsWith('models/gemini') &&
+      (m.supportedGenerationMethods || []).includes('generateContent') &&
+      !/(embedding|tts|image|audio|live|robotics|computer-use)/.test(m.name))
+    .map(m => ({ id: m.name.slice(7), label: String(m.displayName || m.name.slice(7)).slice(0, 60) }))
+    .filter(m => /^[a-z0-9.\-]{3,60}$/.test(m.id))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  modelCache = { at: Date.now(), models };
+  return models;
 }
 function systemPrompt(env, extra = '') {
   return `You are Pocket Agent, a helpful personal assistant answering in Discord. Reply in the language the user writes in (Hong Kong Cantonese in Traditional Chinese if they write Chinese). Be concise and practical; Discord markdown is allowed. You have no access to the user's calendar, email or files and cannot take actions; never claim to have done so.${extra} Current UTC time: ${new Date().toISOString()}. User timezone: ${env.CALENDAR_TIME_ZONE || 'Europe/Copenhagen'}.`;
@@ -102,13 +168,14 @@ async function geminiOnce(env, model, body, timeout) {
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY.trim() },
       body: JSON.stringify(body),
     });
-  } catch { throw new BusyError('Gemini did not answer in time.'); }
+  } catch { await recordUsage(env, model); throw new BusyError('Gemini did not answer in time.'); }
+  await recordUsage(env, model, response.status === 429);
   // Never include Gemini's error body: it can echo request details.
   if (response.status === 429) throw new BusyError('Gemini free limit reached for now.');
   if (BUSY_STATUS.has(response.status)) throw new BusyError(`Gemini is overloaded (HTTP ${response.status}).`);
   if (response.status === 400 || response.status === 401 || response.status === 403)
-    throw new DiscordError(`Gemini refused the request (HTTP ${response.status}). Check GEMINI_API_KEY and GEMINI_MODEL in Cloudflare.`);
-  if (response.status === 404) throw new DiscordError('Gemini model not found. Set GEMINI_MODEL in Cloudflare to a current model name.');
+    throw new DiscordError(`Gemini refused the request (HTTP ${response.status}) for \`${model}\`. Check GEMINI_API_KEY in Cloudflare, or pick another model with /model set.`);
+  if (response.status === 404) throw new DiscordError(`Gemini model \`${model}\` not found. Pick a current one with /model list and /model set.`);
   if (!response.ok) throw new DiscordError(`Gemini is unavailable (HTTP ${response.status}). Please try again later.`);
   const data = await response.json();
   const candidate = data?.candidates?.[0];
@@ -128,9 +195,9 @@ async function geminiOnce(env, model, body, timeout) {
 
 // Tries the main model, retries it once if overloaded, then the lighter model.
 // Discord allows about 30 seconds of background work, so every step respects a deadline.
-export async function askGemini(env, question, web, deadline = Date.now() + 20000) {
-  const primary = modelName(env.GEMINI_MODEL, DEFAULT_GEMINI_MODEL);
-  const fallback = modelName(env.GEMINI_FALLBACK_MODEL, DEFAULT_FALLBACK_MODEL);
+// Returns { text, model } so the reply can say which model answered.
+export async function askGemini(env, question, web, deadline = Date.now() + 20000, models = null) {
+  const { main: primary, backup: fallback } = models || await currentModels(env);
   const body = {
     systemInstruction: { parts: [{ text: systemPrompt(env) }] },
     contents: [{ role: 'user', parts: [{ text: question }] }],
@@ -147,7 +214,7 @@ export async function askGemini(env, question, web, deadline = Date.now() + 2000
     if (i === 1) await sleep(800);
     const left = deadline - Date.now();
     if (left < 2500) break;
-    try { return await geminiOnce(env, model, body, Math.min(limit, left)); }
+    try { return { text: await geminiOnce(env, model, body, Math.min(limit, left)), model }; }
     catch (error) { if (!(error instanceof BusyError)) throw error; last = error; }
   }
   throw last || new BusyError('Gemini did not answer in time.');
@@ -158,6 +225,7 @@ export async function askCloudflare(env, question, deadline) {
   const left = deadline - Date.now();
   if (left < 2000) throw new Error('no time left');
   let timer;
+  await recordUsage(env, 'cloudflare-ai');
   const result = await Promise.race([
     env.AI.run(CLOUDFLARE_MODEL, {
       messages: [{ role: 'system', content: systemPrompt(env, ' You cannot search the web.') }, { role: 'user', content: question }],
@@ -182,8 +250,10 @@ async function sendFollowUp(env, token, chunks) {
 async function answer(env, interaction, question, web) {
   const started = Date.now();
   let text;
-  try { text = await askGemini(env, question, web, started + 20000); }
-  catch (error) {
+  try {
+    const result = await askGemini(env, question, web, started + 20000);
+    text = `${result.text}\n\n-# ${result.model}${web ? ' · web search' : ''}`;
+  } catch (error) {
     if (error instanceof BusyError && typeof env.AI?.run === 'function') {
       try { text = `${await askCloudflare(env, question, started + 27000)}\n\n-# Answered by Cloudflare AI because Gemini was busy (${error.message.replace(/\.$/, '')}).`; }
       catch { text = `⚠️ ${error.message} The Cloudflare AI backup also failed. Please try again in a minute.`; }
@@ -198,6 +268,75 @@ async function answer(env, interaction, question, web) {
 function ephemeral(content) {
   return json({ type: 4, data: { content, flags: 64, allowed_mentions: { parse: [] } } });
 }
+const DEFER_PRIVATE = () => json({ type: 5, data: { flags: 64 } });
+async function privateFollowUp(env, interaction, work) {
+  let text;
+  try { text = await work(); }
+  catch (error) { text = `⚠️ ${error instanceof DiscordError ? error.message : 'Something went wrong. Please try again.'}`; }
+  try { await sendFollowUp(env, interaction.token, splitMessage(text)); } catch { /* Discord unreachable. */ }
+}
+function describeModels(models) {
+  return `**Main model:** \`${models.main}\` (${models.mainSource})\n**Backup model:** \`${models.backup}\` (${models.backupSource})\n` +
+    '-# When the main model is busy, /ask retries it once, then uses the backup, then the free Cloudflare AI.';
+}
+async function modelList(env) {
+  const [models, current] = await Promise.all([listModels(env), currentModels(env)]);
+  if (!models.length) return 'Google returned no Gemini chat models for this key.';
+  const lines = models.map(m => `${m.id === current.main ? '✅' : m.id === current.backup ? '🔁' : '•'} \`${m.id}\` — ${m.label}`);
+  return `**Gemini models your key can use** (✅ main, 🔁 backup)\n${lines.join('\n')}\n\n` +
+    `-# Names ending in -latest follow Google's newest version. Pro models have much lower free limits. Change with /model set.`;
+}
+async function setModel(env, name, backup) {
+  const id = name.replace(/^models\//, '').trim().toLowerCase();
+  if (!/^[a-z0-9.\-]{3,60}$/.test(id)) throw new DiscordError('That is not a valid model name. Use /model list to see the options.');
+  let response;
+  try {
+    response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${id}`, {
+      signal: AbortSignal.timeout(8000), headers: { 'x-goog-api-key': env.GEMINI_API_KEY.trim() } });
+  } catch { throw new DiscordError('Google did not answer in time. Try again.'); }
+  if (response.status === 404 || response.status === 400) throw new DiscordError(`Google has no model called \`${id}\`. Use /model list to see the options.`);
+  if (!response.ok) throw new DiscordError(`Google returned HTTP ${response.status}. Try again later.`);
+  const info = await response.json();
+  if (!(info.supportedGenerationMethods || []).includes('generateContent'))
+    throw new DiscordError(`\`${id}\` can't answer chat questions. Pick another from /model list.`);
+  const db = database(env);
+  if (!db) throw new DiscordError('The database is not connected, so the choice cannot be saved.');
+  try {
+    await db.prepare('INSERT INTO discord_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .bind(backup ? 'backup' : 'model', id).run();
+  } catch { throw new DiscordError('Could not save the choice. Open /admin and tap Register Discord commands once, then try again.'); }
+  return `Saved. /ask now uses \`${id}\` as its ${backup ? 'backup' : 'main'} model.\n\n${describeModels(await currentModels(env))}`;
+}
+async function resetModels(env) {
+  const db = database(env);
+  if (db) { try { await db.prepare("DELETE FROM discord_settings WHERE key IN ('model', 'backup')").run(); } catch { /* nothing saved yet */ } }
+  return `Back to the defaults.\n\n${describeModels(await currentModels(env))}`;
+}
+async function usageReport(env) {
+  const db = database(env);
+  let rows = [];
+  if (db) {
+    try {
+      // Keep about a month of counts.
+      await db.prepare('DELETE FROM ai_usage WHERE day < ?').bind(new Date(Date.now() - 35 * 86400000).toISOString().slice(0, 10)).run();
+      rows = (await db.prepare('SELECT model, requests, limited FROM ai_usage WHERE day = ? ORDER BY requests DESC').bind(today()).all()).results || [];
+    } catch { /* table not created yet */ }
+  }
+  const body = rows.length
+    ? rows.map(r => `• \`${r.model}\`: ${r.requests} request${r.requests === 1 ? '' : 's'}${r.limited ? ` (${r.limited} hit the free limit)` : ''}`).join('\n')
+    : 'No AI requests yet today.';
+  return `**AI requests today** (${today()}, UTC)\n${body}\n\n` +
+    `-# Counted by Pocket Agent; retries count separately. Google doesn't report remaining quota to apps, so check your limits and usage at <${LIMITS_URL}>. Free limits reset daily (Pacific time).`;
+}
+async function autocomplete(env, interaction) {
+  const set = interaction.data?.options?.find(o => o.name === 'set');
+  const typed = String(set?.options?.find(o => o.focused)?.value || '').toLowerCase().slice(0, 60);
+  let models = [];
+  try { models = await listModels(env, 2000); } catch { /* answer with no suggestions */ }
+  const choices = models.filter(m => m.id.includes(typed) || m.label.toLowerCase().includes(typed)).slice(0, 25)
+    .map(m => ({ name: `${m.id} — ${m.label}`.slice(0, 100), value: m.id }));
+  return json({ type: 8, data: { choices } });
+}
 
 export async function discordInteraction(request, env, ctx) {
   try {
@@ -208,17 +347,38 @@ export async function discordInteraction(request, env, ctx) {
     let interaction;
     try { interaction = JSON.parse(body); } catch { throw new DiscordError('Invalid JSON.'); }
     if (interaction.type === 1) return json({ type: 1 });
-    if (interaction.type !== 2) return json({ error: 'Unsupported interaction.' }, 400);
+    if (interaction.type !== 2 && interaction.type !== 4) return json({ error: 'Unsupported interaction.' }, 400);
     if (String(interaction.application_id) !== String(env.DISCORD_APPLICATION_ID)) return json({ error: 'Wrong application.' }, 400);
     const userId = interaction.member?.user?.id ?? interaction.user?.id;
     const owner = (env.DISCORD_ALLOWED_USER_ID || '').trim();
-    if (!owner || userId !== owner) return ephemeral('Sorry, this Pocket Agent only answers its owner.');
-    if (interaction.data?.name !== 'ask') return ephemeral('Unknown command. Re-register commands from the setup page.');
+    const isOwner = Boolean(owner) && userId === owner;
+    const name = interaction.data?.name;
+    if (interaction.type === 4) {
+      if (!isOwner || name !== 'model' || !(env.GEMINI_API_KEY || '').trim()) return json({ type: 8, data: { choices: [] } });
+      return autocomplete(env, interaction);
+    }
+    if (!isOwner) return ephemeral('Sorry, this Pocket Agent only answers its owner.');
+    if (!['ask', 'model', 'usage'].includes(name)) return ephemeral('Unknown command. Re-register commands from the setup page.');
+    if (typeof interaction.token !== 'string' || !/^[\w.-]{20,500}$/.test(interaction.token)) return json({ error: 'Invalid token.' }, 400);
+    if (name === 'usage') return ephemeral(await usageReport(env));
+    if (name === 'model') {
+      const sub = interaction.data.options?.[0];
+      if (sub?.name === 'show') return ephemeral(describeModels(await currentModels(env)));
+      if (sub?.name === 'reset') return ephemeral(await resetModels(env));
+      if (!(env.GEMINI_API_KEY || '').trim()) return ephemeral('Gemini is not set up yet: add GEMINI_API_KEY in Cloudflare.');
+      if (sub?.name === 'list') { ctx.waitUntil(privateFollowUp(env, interaction, () => modelList(env))); return DEFER_PRIVATE(); }
+      if (sub?.name === 'set') {
+        const opts = Object.fromEntries((sub.options || []).map(o => [o.name, o.value]));
+        if (typeof opts.name !== 'string') return ephemeral('Give a model name, e.g. gemini-flash-latest.');
+        ctx.waitUntil(privateFollowUp(env, interaction, () => setModel(env, opts.name, opts.backup === true)));
+        return DEFER_PRIVATE();
+      }
+      return ephemeral('Unknown /model option. Re-register commands from the setup page.');
+    }
     const options = Object.fromEntries((interaction.data.options || []).map(o => [o.name, o.value]));
     const question = typeof options.question === 'string' ? options.question.trim() : '';
     if (!question || question.length > 1500) return ephemeral('Please ask a question under 1,500 characters.');
     if (!(env.GEMINI_API_KEY || '').trim()) return ephemeral('Gemini is not set up yet: add GEMINI_API_KEY in Cloudflare.');
-    if (typeof interaction.token !== 'string' || !/^[\w.-]{20,500}$/.test(interaction.token)) return json({ error: 'Invalid token.' }, 400);
     // Discord needs a reply within 3 seconds, so acknowledge now and answer afterwards.
     ctx.waitUntil(answer(env, interaction, question, options.web === true));
     return json({ type: 5 });
@@ -232,6 +392,11 @@ export async function discordInteraction(request, env, ctx) {
 export async function registerCommands(env) {
   const missing = missingDiscordSettings(env).filter(name => name !== 'GEMINI_API_KEY');
   if (missing.length) throw new DiscordError(`Add these settings in Cloudflare first: ${missing.join(', ')}.`, 503);
+  const db = database(env);
+  if (!db) throw new DiscordError('The D1 database binding DB is missing.', 503);
+  // Tables for /model and /usage; safe to run again.
+  await db.prepare(SETTINGS_TABLE).run();
+  await db.prepare(USAGE_TABLE).run();
   let response;
   try {
     response = await fetch(`${API}/applications/${env.DISCORD_APPLICATION_ID}/commands`, {

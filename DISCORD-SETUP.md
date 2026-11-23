@@ -39,6 +39,23 @@ Do this after the version with Discord support has deployed.
 2. Open https://pocket-agent-cloud.enderscheng.workers.dev/admin, sign in, and check that the **Discord** section reports every setting present. Tap **Register Discord commands**.
 3. In your server, type `/ask question: what's a good 20-minute dinner?`. Add `web: True` to let Gemini search Google first. The answer then lists its sources.
 
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `/ask question: … web: True/False` | Ask Gemini. The small line under each answer names the model that answered. |
+| `/model show` | Main and backup model, and where each was set (Discord, Cloudflare variable or default). |
+| `/model list` | Every Gemini chat model your key can use. ✅ marks the main model, 🔁 the backup. |
+| `/model set name: … backup: True/False` | Change the main model (or the backup). Suggestions appear as you type. A model set here overrides the Cloudflare variables. |
+| `/model reset` | Remove the Discord choice and go back to the Cloudflare variables or the defaults. |
+| `/usage` | Requests Pocket Agent sent today (UTC) per model, including free-limit hits. |
+
+Only you see the replies to `/model` and `/usage`.
+
+Google doesn't tell apps how much free quota is left, so `/usage` shows Pocket Agent's own count. Your official limits and remaining usage are at https://aistudio.google.com/usage.
+
+After updating to this version, open `/admin` and tap **Register Discord commands** again. This adds `/model` and `/usage` and creates their two small database tables.
+
 ## Troubleshooting
 
 - **Portal says the endpoint could not be verified:** wait for the deployment, then check `DISCORD_PUBLIC_KEY` (64 hex characters, no spaces).
@@ -46,7 +63,8 @@ Do this after the version with Discord support has deployed.
 - **"only answers its owner":** `DISCORD_ALLOWED_USER_ID` must be your own user ID, not the server or app ID.
 - **Busy Gemini (HTTP 503):** Pocket Agent retries once, then tries the lighter Gemini model, then answers with the free Cloudflare AI. That reply is labelled *Answered by Cloudflare AI* and can't search the web.
 - **"Gemini free limit reached":** wait a minute, or until the next day for the daily limit.
-- **"Gemini model not found":** set `GEMINI_MODEL` to a current Flash model name from Google AI Studio.
+- **"model … not found":** pick a current model with `/model list` and `/model set`.
+- **"Could not save the choice":** tap **Register Discord commands** on `/admin` once to create the tables.
 - **"Discord rejected DISCORD_BOT_TOKEN":** reset the bot token and update the secret.
 
 ## Validation

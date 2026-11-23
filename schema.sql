@@ -13,3 +13,11 @@ CREATE TABLE IF NOT EXISTS integration (
   create_state TEXT NOT NULL DEFAULT 'idle'
     CHECK (create_state IN ('idle', 'creating', 'uncertain', 'ready'))
 );
+CREATE TABLE IF NOT EXISTS discord_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS ai_usage (
+  day TEXT NOT NULL,
+  model TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  limited INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, model)
+);
