@@ -27,6 +27,7 @@ Open https://dash.cloudflare.com → **Workers & Pages** → **pocket-agent-clou
 | `DISCORD_ALLOWED_USER_ID` | Secret | Your Discord user ID |
 | `GEMINI_API_KEY` | Secret | Gemini key |
 | `GEMINI_MODEL` | Text, optional | Defaults to `gemini-flash-latest` |
+| `GEMINI_FALLBACK_MODEL` | Text, optional | Lighter model used when the main one is busy. Defaults to `gemini-flash-lite-latest` |
 
 Deploy the settings. Keep your existing Google and voice settings unchanged.
 
@@ -43,6 +44,7 @@ Do this after the version with Discord support has deployed.
 - **Portal says the endpoint could not be verified:** wait for the deployment, then check `DISCORD_PUBLIC_KEY` (64 hex characters, no spaces).
 - **`/ask` doesn't appear:** register commands again and restart Discord. Check that the app is installed on the server.
 - **"only answers its owner":** `DISCORD_ALLOWED_USER_ID` must be your own user ID, not the server or app ID.
+- **Busy Gemini (HTTP 503):** Pocket Agent retries once, then tries the lighter Gemini model, then answers with the free Cloudflare AI. That reply is labelled *Answered by Cloudflare AI* and can't search the web.
 - **"Gemini free limit reached":** wait a minute, or until the next day for the daily limit.
 - **"Gemini model not found":** set `GEMINI_MODEL` to a current Flash model name from Google AI Studio.
 - **"Discord rejected DISCORD_BOT_TOKEN":** reset the bot token and update the secret.

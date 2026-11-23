@@ -1,7 +1,10 @@
 // Discord slash commands for the owner only: /ask sends one question to Gemini.
 // No calendar, Google account, notes or voice-key access is reachable from here.
+import { answerText } from './voice.js';
 const API = 'https://discord.com/api/v10';
 const DEFAULT_GEMINI_MODEL = 'gemini-flash-latest';
+const DEFAULT_FALLBACK_MODEL = 'gemini-flash-lite-latest';
+const CLOUDFLARE_MODEL = '@cf/zai-org/glm-4.7-flash';
 const MAX_BODY = 65536;
 const MAX_CHUNK = 1900;
 const MAX_CHUNKS = 4;
@@ -79,27 +82,30 @@ export function splitMessage(text) {
   return chunks;
 }
 
-export async function askGemini(env, question, web) {
-  const model = (env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL).trim();
-  if (!/^[a-z0-9.\-]{3,60}$/.test(model)) throw new DiscordError('GEMINI_MODEL is not a valid model name.');
-  const now = new Date().toISOString();
-  const system = `You are Pocket Agent, a helpful personal assistant answering in Discord. Reply in the language the user writes in (Hong Kong Cantonese in Traditional Chinese if they write Chinese). Be concise and practical; Discord markdown is allowed. You have no access to the user's calendar, email or files and cannot take actions; never claim to have done so. Current UTC time: ${now}. User timezone: ${env.CALENDAR_TIME_ZONE || 'Europe/Copenhagen'}.`;
-  const body = {
-    systemInstruction: { parts: [{ text: system }] },
-    contents: [{ role: 'user', parts: [{ text: question }] }],
-    generationConfig: { maxOutputTokens: 2048, temperature: 0.6 },
-  };
-  if (web) body.tools = [{ google_search: {} }];
+const BUSY_STATUS = new Set([500, 502, 503, 504]);
+// Temporary trouble (overload, rate limit, timeout): worth trying another model.
+class BusyError extends DiscordError {}
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function modelName(value, fallback) {
+  const model = (value || fallback).trim();
+  if (!/^[a-z0-9.\-]{3,60}$/.test(model)) throw new DiscordError('GEMINI_MODEL or GEMINI_FALLBACK_MODEL is not a valid model name.');
+  return model;
+}
+function systemPrompt(env, extra = '') {
+  return `You are Pocket Agent, a helpful personal assistant answering in Discord. Reply in the language the user writes in (Hong Kong Cantonese in Traditional Chinese if they write Chinese). Be concise and practical; Discord markdown is allowed. You have no access to the user's calendar, email or files and cannot take actions; never claim to have done so.${extra} Current UTC time: ${new Date().toISOString()}. User timezone: ${env.CALENDAR_TIME_ZONE || 'Europe/Copenhagen'}.`;
+}
+async function geminiOnce(env, model, body, timeout) {
   let response;
   try {
     response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: 'POST', signal: AbortSignal.timeout(25000),
+      method: 'POST', signal: AbortSignal.timeout(timeout),
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY.trim() },
       body: JSON.stringify(body),
     });
-  } catch { throw new DiscordError('Gemini did not answer in time. Please try again.'); }
+  } catch { throw new BusyError('Gemini did not answer in time.'); }
   // Never include Gemini's error body: it can echo request details.
-  if (response.status === 429) throw new DiscordError('Gemini free limit reached for now. Try again in a minute, or tomorrow if the daily limit is used up.');
+  if (response.status === 429) throw new BusyError('Gemini free limit reached for now.');
+  if (BUSY_STATUS.has(response.status)) throw new BusyError(`Gemini is overloaded (HTTP ${response.status}).`);
   if (response.status === 400 || response.status === 401 || response.status === 403)
     throw new DiscordError(`Gemini refused the request (HTTP ${response.status}). Check GEMINI_API_KEY and GEMINI_MODEL in Cloudflare.`);
   if (response.status === 404) throw new DiscordError('Gemini model not found. Set GEMINI_MODEL in Cloudflare to a current model name.');
@@ -109,7 +115,7 @@ export async function askGemini(env, question, web) {
   const text = (candidate?.content?.parts || []).map(part => typeof part.text === 'string' && !part.thought ? part.text : '').join('').trim();
   if (!text) {
     if (data?.promptFeedback?.blockReason || candidate?.finishReason === 'SAFETY') throw new DiscordError('Gemini declined to answer that question.');
-    throw new DiscordError('Gemini returned an empty answer. Please try again.');
+    throw new BusyError('Gemini returned an empty answer.');
   }
   const sources = [];
   for (const chunk of candidate?.groundingMetadata?.groundingChunks || []) {
@@ -118,6 +124,48 @@ export async function askGemini(env, question, web) {
       sources.push(`- [${String(chunk.web.title || 'source').replace(/[\[\]\n]/g, '').slice(0, 80)}](<${uri}>)`);
   }
   return sources.length ? `${text}\n\n**Sources**\n${sources.join('\n')}` : text;
+}
+
+// Tries the main model, retries it once if overloaded, then the lighter model.
+// Discord allows about 30 seconds of background work, so every step respects a deadline.
+export async function askGemini(env, question, web, deadline = Date.now() + 20000) {
+  const primary = modelName(env.GEMINI_MODEL, DEFAULT_GEMINI_MODEL);
+  const fallback = modelName(env.GEMINI_FALLBACK_MODEL, DEFAULT_FALLBACK_MODEL);
+  const body = {
+    systemInstruction: { parts: [{ text: systemPrompt(env) }] },
+    contents: [{ role: 'user', parts: [{ text: question }] }],
+    generationConfig: { maxOutputTokens: 2048, temperature: 0.6 },
+  };
+  if (web) body.tools = [{ google_search: {} }];
+  const attempts = [[primary, 9000], [primary, 6000], [fallback, 7000]];
+  let last;
+  for (let i = 0; i < attempts.length; i++) {
+    const [model, limit] = attempts[i];
+    // A rate limit won't clear in a second, so skip the same-model retry; go to the lighter model.
+    if (i === 1 && /limit/.test(last.message)) continue;
+    if (i === 2 && model === primary) break;
+    if (i === 1) await sleep(800);
+    const left = deadline - Date.now();
+    if (left < 2500) break;
+    try { return await geminiOnce(env, model, body, Math.min(limit, left)); }
+    catch (error) { if (!(error instanceof BusyError)) throw error; last = error; }
+  }
+  throw last || new BusyError('Gemini did not answer in time.');
+}
+
+// Free backup: the Cloudflare Workers AI model already used for voice chat.
+export async function askCloudflare(env, question, deadline) {
+  const left = deadline - Date.now();
+  if (left < 2000) throw new Error('no time left');
+  let timer;
+  const result = await Promise.race([
+    env.AI.run(CLOUDFLARE_MODEL, {
+      messages: [{ role: 'system', content: systemPrompt(env, ' You cannot search the web.') }, { role: 'user', content: question }],
+      max_completion_tokens: 900, temperature: 0.6, stream: false, chat_template_kwargs: { enable_thinking: false },
+    }),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), left); }),
+  ]).finally(() => clearTimeout(timer));
+  return answerText(result);
 }
 
 async function sendFollowUp(env, token, chunks) {
@@ -132,9 +180,17 @@ async function sendFollowUp(env, token, chunks) {
   }
 }
 async function answer(env, interaction, question, web) {
+  const started = Date.now();
   let text;
-  try { text = await askGemini(env, question, web); }
-  catch (error) { text = `⚠️ ${error instanceof DiscordError ? error.message : 'Something went wrong. Please try again.'}`; }
+  try { text = await askGemini(env, question, web, started + 20000); }
+  catch (error) {
+    if (error instanceof BusyError && typeof env.AI?.run === 'function') {
+      try { text = `${await askCloudflare(env, question, started + 27000)}\n\n-# Answered by Cloudflare AI because Gemini was busy (${error.message.replace(/\.$/, '')}).`; }
+      catch { text = `⚠️ ${error.message} The Cloudflare AI backup also failed. Please try again in a minute.`; }
+    } else {
+      text = `⚠️ ${error instanceof DiscordError ? error.message : 'Something went wrong.'} Please try again in a minute.`;
+    }
+  }
   const quoted = question.length > 200 ? question.slice(0, 200) + '…' : question;
   try { await sendFollowUp(env, interaction.token, splitMessage(`> ${quoted.replace(/\n/g, ' ')}\n\n${text}`)); }
   catch { /* Discord unreachable: nothing else to report to. Never log content or tokens. */ }

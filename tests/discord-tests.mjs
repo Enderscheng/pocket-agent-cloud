@@ -80,6 +80,35 @@ export async function runDiscordTests(worker) {
     const limited = JSON.parse(calls.find(c => c.url.includes('@original')).options.body).content;
     check(limited.includes('free limit') && !limited.includes('private-gemini-key'), 'Rate-limit error explained without echoing Gemini body');
 
+    // Overloaded Gemini: retry the same model, then succeed.
+    calls.length = 0;
+    let geminiCalls = 0;
+    gemini = () => ++geminiCalls === 1 ? new Response('busy', { status: 503 })
+      : Response.json({ candidates: [{ content: { parts: [{ text: 'Second try worked' }] } }] });
+    await send(ask('retry please'));
+    let posted = JSON.parse(calls.find(c => c.url.includes('@original')).options.body).content;
+    check(geminiCalls === 2 && posted.includes('Second try worked'), 'Overloaded Gemini is retried once');
+
+    // Still overloaded: lighter Gemini model, then Cloudflare AI backup.
+    calls.length = 0;
+    const models = [];
+    gemini = url => { models.push(url.match(/models\/([^:]+):/)[1]); return new Response('busy', { status: 503 }); };
+    let aiQuestion;
+    env.AI = { async run(model, body) { aiQuestion = body.messages.at(-1).content;
+      return { choices: [{ message: { content: 'Backup answer' }, finish_reason: 'stop' }] }; } };
+    await send(ask('fallback please'));
+    posted = JSON.parse(calls.find(c => c.url.includes('@original')).options.body).content;
+    check(models.join(',') === 'gemini-flash-latest,gemini-flash-latest,gemini-flash-lite-latest', 'Lighter Gemini model tried after retries');
+    check(aiQuestion === 'fallback please' && posted.includes('Backup answer') && posted.includes('Answered by Cloudflare AI'), 'Cloudflare AI answers and is labelled when Gemini is down');
+
+    // Configuration errors are reported, not hidden behind a backup answer.
+    calls.length = 0;
+    gemini = () => new Response('nope', { status: 404 });
+    await send(ask('bad model'));
+    posted = JSON.parse(calls.find(c => c.url.includes('@original')).options.body).content;
+    check(posted.includes('model not found') && !posted.includes('Backup answer'), 'Wrong model name reported without fallback');
+    delete env.AI;
+
     const parts = splitMessage(('word '.repeat(500) + '\n\n').repeat(4));
     check(parts.length <= 4 && parts.every(p => p.length <= 2000), 'Long answers split within Discord limits');
 
