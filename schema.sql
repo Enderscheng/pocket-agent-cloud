@@ -21,3 +21,5 @@ CREATE TABLE IF NOT EXISTS ai_usage (
   limited INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day, model)
 );
+CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, title TEXT NOT NULL, due_date TEXT NOT NULL, due_time TEXT, notes TEXT, event_id TEXT, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mail_seen (source_id TEXT PRIMARY KEY, seen_at TEXT NOT NULL);

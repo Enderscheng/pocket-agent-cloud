@@ -4,6 +4,8 @@ Version 0.3 adds an owner-only Discord `/ask` command answered by Google Gemini.
 
 Version 0.4 adds a Discord control panel (`/panel`) and asking by voice through Siri, with answers also posted to Discord. See [SIRI-SETUP.md](SIRI-SETUP.md).
 
+Version 0.5 finds deadlines in Gmail (and school Outlook forwarded to Gmail) and in Siri notes, writes them to the Agent calendar (visible in Apple Calendar), announces them in Discord with a Cancel button, adds `/todo` and a morning summary. Setup in Cantonese: [MAIL-SETUP.md](MAIL-SETUP.md).
+
 Version 0.2 adds Cantonese voice conversation through the updated iPhone app and Cloudflare Workers AI. Follow [VOICE-SETUP.md](VOICE-SETUP.md) to install and pair. Calendar event actions, reminders, and Obsidian delivery are not implemented yet. The cloud service works independently of your laptop. The original Google/calendar setup instructions follow.
 
 ## A. Deploy the service

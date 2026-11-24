@@ -7,3 +7,5 @@ console.log(await runVoiceTests(worker));
 console.log(await runDiscordTests(worker));
 import { runPanelSiriTests } from './panel-siri-tests.mjs';
 console.log(await runPanelSiriTests(worker));
+import { runTaskTests } from './tasks-tests.mjs';
+console.log(await runTaskTests(worker));

@@ -3,6 +3,7 @@
 // button-and-menu control panel for the same settings plus the Siri channel.
 // No calendar, Google account, notes or voice-key access is reachable from here.
 import { answerText } from './voice.js';
+import { cancelTask, agendaMarkdown, ensureTaskTables, describeDue, isChinese, TaskError } from './tasks.js';
 const API = 'https://discord.com/api/v10';
 const DEFAULT_GEMINI_MODEL = 'gemini-flash-latest';
 const DEFAULT_FALLBACK_MODEL = 'gemini-flash-lite-latest';
@@ -33,6 +34,8 @@ export const COMMANDS = [{
   name: 'usage', type: 1, description: 'Show how many AI requests Pocket Agent made today',
 }, {
   name: 'panel', type: 1, description: 'Open the Pocket Agent control panel (models, usage, Siri)',
+}, {
+  name: 'todo', type: 1, description: 'Show deadlines and to-dos for the next 14 days',
 }];
 const LIMITS_URL = 'https://aistudio.google.com/usage';
 
@@ -131,7 +134,7 @@ export async function currentModels(env) {
   const [backup, backupSource] = pick(saved.backup, env.GEMINI_FALLBACK_MODEL, DEFAULT_FALLBACK_MODEL);
   return { main: modelName(main), mainSource, backup: modelName(backup), backupSource };
 }
-async function recordUsage(env, model, limited = false) {
+export async function recordUsage(env, model, limited = false) {
   const db = database(env);
   if (!db) return;
   try {
@@ -275,7 +278,7 @@ const DEFER_PRIVATE = () => json({ type: 5, data: { flags: 64 } });
 async function privateFollowUp(env, interaction, work) {
   let text;
   try { text = await work(); }
-  catch (error) { text = `⚠️ ${error instanceof DiscordError ? error.message : 'Something went wrong. Please try again.'}`; }
+  catch (error) { text = `⚠️ ${error instanceof DiscordError || error instanceof TaskError ? error.message : 'Something went wrong. Please try again.'}`; }
   try { await sendFollowUp(env, interaction.token, splitMessage(text)); } catch { /* Discord unreachable. */ }
 }
 function describeModels(models) {
@@ -323,15 +326,17 @@ export async function siriChannel(env) {
   } catch { return null; }
 }
 // Posts as the bot. Needs View Channel and Send Messages in that channel.
-export async function postToChannel(env, channelId, text) {
+export async function postToChannel(env, channelId, text, extra = {}) {
   if (!/^\d{15,22}$/.test(channelId || '') || !(env.DISCORD_BOT_TOKEN || '').trim()) return false;
   let ok = true;
-  for (const chunk of splitMessage(text)) {
+  const chunks = splitMessage(text);
+  for (const [index, chunk] of chunks.entries()) {
     try {
       const response = await fetch(`${API}/channels/${channelId}/messages`, {
         method: 'POST', signal: AbortSignal.timeout(8000),
         headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN.trim()}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: chunk, allowed_mentions: { parse: [] } }),
+        // Buttons go on the last part only.
+        body: JSON.stringify({ content: chunk, allowed_mentions: { parse: [] }, ...(index === chunks.length - 1 ? extra : {}) }),
       });
       ok &&= response.ok;
     } catch { ok = false; }
@@ -372,6 +377,23 @@ async function autocomplete(env, interaction) {
   return json({ type: 8, data: { choices } });
 }
 
+// Cancel button under a deadline message: removes the calendar event and strikes the message through.
+async function cancelFromButton(env, interaction) {
+  const id = Number(interaction.data.custom_id.split(':')[2]);
+  const original = String(interaction.message?.content || '');
+  let content;
+  try {
+    const task = await cancelTask(env, id);
+    const chinese = isChinese(task.title + (task.notes || ''));
+    content = `~~${task.title} — ${describeDue(task, chinese)}~~\n${chinese ? '❌ 已取消，並已由日曆刪除。' : '❌ Cancelled and removed from the calendar.'}`;
+  } catch (error) {
+    const reason = error instanceof TaskError || error instanceof DiscordError ? error.message : 'Something went wrong.';
+    await editOriginal(env, interaction.token, { content: `${original}\n\n⚠️ ${reason}`.slice(0, 2000) });
+    return;
+  }
+  await editOriginal(env, interaction.token, { content, components: [] });
+}
+
 // ---- /panel: one private message with menus and buttons ----
 async function editOriginal(env, token, payload) {
   try {
@@ -397,7 +419,7 @@ export async function panelMessage(env, note = '') {
     fields: [
       { name: 'Main model', value: `\`${current.main}\`\n-# ${current.mainSource}`, inline: true },
       { name: 'Backup model', value: `\`${current.backup}\`\n-# ${current.backupSource}`, inline: true },
-      { name: 'Siri answers go to', value: channel ? `<#${channel}>` : 'Not set: press **Send Siri answers here** in the channel you want.', inline: false },
+      { name: 'Siri, deadline and daily-summary messages go to', value: channel ? `<#${channel}>` : 'Not set: press **Send Siri & deadline updates here** in the channel you want.', inline: false },
       { name: `Requests today (${today()} UTC)`, value: usageLines(rows).slice(0, 1000), inline: false },
     ],
     footer: { text: `${listProblem ? listProblem + ' ' : ''}Google doesn't share remaining quota with apps: use "Quota on Google" to see it.`.slice(0, 2000) },
@@ -409,7 +431,7 @@ export async function panelMessage(env, note = '') {
   }
   components.push({ type: 1, components: [
     { type: 2, style: 2, custom_id: 'panel:refresh', label: 'Refresh', emoji: { name: '🔄' } },
-    { type: 2, style: 1, custom_id: 'panel:siri', label: 'Send Siri answers here', emoji: { name: '🎙️' } },
+    { type: 2, style: 1, custom_id: 'panel:siri', label: 'Send Siri & deadline updates here', emoji: { name: '🎙️' } },
     { type: 2, style: 4, custom_id: 'panel:reset', label: 'Reset models' },
     { type: 2, style: 5, url: LIMITS_URL, label: 'Quota on Google' },
   ] });
@@ -432,7 +454,7 @@ async function panelAction(env, interaction) {
     const channel = String(interaction.channel_id || '');
     if (!/^\d{15,22}$/.test(channel)) return panelMessage(env, '⚠️ Open the panel inside a server channel to choose it for Siri.');
     await saveSetting(env, 'siri_channel', channel);
-    const posted = await postToChannel(env, channel, '🎙️ Siri questions and answers will be posted in this channel.');
+    const posted = await postToChannel(env, channel, '🎙️ Siri answers, new deadlines and the morning summary will be posted in this channel.');
     return panelMessage(env, posted ? '✅ Siri answers will be posted in this channel.'
       : "⚠️ Saved, but the bot couldn't post here. Give the Pocket Agent bot View Channel and Send Messages in this channel.");
   }
@@ -469,13 +491,21 @@ export async function discordInteraction(request, env, ctx) {
     }
     if (!isOwner) return ephemeral('Sorry, this Pocket Agent only answers its owner.');
     if (typeof interaction.token !== 'string' || !/^[\w.-]{20,500}$/.test(interaction.token)) return json({ error: 'Invalid token.' }, 400);
+    if (interaction.type === 3 && /^task:cancel:\d{1,12}$/.test(interaction.data?.custom_id || '')) {
+      ctx.waitUntil(cancelFromButton(env, interaction));
+      return json({ type: 6 });
+    }
     if (interaction.type === 3) {
       if (!/^panel:(main|backup|refresh|reset|siri)$/.test(interaction.data?.custom_id || '')) return ephemeral('This button is out of date. Open /panel again.');
       // Acknowledge now; the panel message is edited in place once the change is saved.
       ctx.waitUntil(panelUpdate(env, interaction.token, () => panelAction(env, interaction)));
       return json({ type: 6 });
     }
-    if (!['ask', 'model', 'usage', 'panel'].includes(name)) return ephemeral('Unknown command. Re-register commands from the setup page.');
+    if (!['ask', 'model', 'usage', 'panel', 'todo'].includes(name)) return ephemeral('Unknown command. Re-register commands from the setup page.');
+    if (name === 'todo') {
+      ctx.waitUntil(privateFollowUp(env, interaction, async () => `**未來 14 日要做嘅嘢**\n${await agendaMarkdown(env, 14)}\n-# 要取消，撳返嗰項通知下面嘅「取消」掣。`));
+      return DEFER_PRIVATE();
+    }
     if (name === 'panel') { ctx.waitUntil(panelUpdate(env, interaction.token, () => panelMessage(env))); return DEFER_PRIVATE(); }
     if (name === 'usage') return ephemeral(await usageReport(env));
     if (name === 'model') {
@@ -511,9 +541,10 @@ export async function registerCommands(env) {
   if (missing.length) throw new DiscordError(`Add these settings in Cloudflare first: ${missing.join(', ')}.`, 503);
   const db = database(env);
   if (!db) throw new DiscordError('The D1 database binding DB is missing.', 503);
-  // Tables for /model, /usage and /panel; safe to run again.
+  // Tables for /model, /usage, /panel and /todo; safe to run again.
   await db.prepare(SETTINGS_TABLE).run();
   await db.prepare(USAGE_TABLE).run();
+  await ensureTaskTables(db);
   let response;
   try {
     response = await fetch(`${API}/applications/${env.DISCORD_APPLICATION_ID}/commands`, {

@@ -2,25 +2,16 @@
 import { pairVoice, voiceChat } from "./voice.js";
 import { discordInteraction, registerCommands, missingDiscordSettings, DiscordError } from "./discord.js";
 import { pairSiri, siriAsk } from "./siri.js";
+import { pairMail, mailIngest, appsScript } from "./mail.js";
+import { dailyDigest } from "./tasks.js";
+import { SetupError, b64, unb64, digest, encrypt, decrypt, googleJSON, accessToken } from "./google.js";
 const CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.app.created";
 const SCOPES = `openid email ${CALENDAR_SCOPE}`;
 const COOKIE = "__Host-pocket-admin";
 const encoder = new TextEncoder();
 const SESSION_SECONDS = 1800;
 
-class SetupError extends Error {
-  constructor(message, status = 400) { super(message); this.status = status; }
-}
-
-function b64(bytes) {
-  return btoa(String.fromCharCode(...new Uint8Array(bytes)))
-    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-function unb64(text) {
-  return Uint8Array.from(atob(text.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
-}
 function random() { return b64(crypto.getRandomValues(new Uint8Array(32))); }
-async function digest(value) { return new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(value))); }
 async function equal(a, b) {
   const [x, y] = await Promise.all([digest(a), digest(b)]);
   let diff = 0;
@@ -50,21 +41,6 @@ async function session(request, env) {
       typeof value.csrf !== "string" || typeof value.sid !== "string") return null;
     return value;
   } catch { return null; }
-}
-async function encryptionKey(env) {
-  return crypto.subtle.importKey("raw", await digest(`pocket-agent-storage-v1:${env.ENCRYPTION_KEY}`),
-    "AES-GCM", false, ["encrypt", "decrypt"]);
-}
-async function encrypt(env, value) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv },
-    await encryptionKey(env), encoder.encode(value));
-  return `${b64(iv)}.${b64(encrypted)}`;
-}
-async function decrypt(env, value) {
-  const [iv, encrypted] = value.split(".");
-  return new TextDecoder().decode(await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: unb64(iv) }, await encryptionKey(env), unb64(encrypted)));
 }
 function escape(value) {
   return String(value).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -137,47 +113,26 @@ async function form(request, env, admin = null) {
   return data;
 }
 function csrf(admin) { return `<input type="hidden" name="csrf" value="${escape(admin.csrf)}">`; }
-async function googleJSON(url, options) {
-  let response;
-  try { response = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) }); }
-  catch { throw new SetupError("Google could not be reached. Return to setup and try again.", 502); }
-  if (!response.ok) {
-    const status = response.status;
-    // Never include Google's body, tokens, or authorization headers in errors/logs.
-    throw new SetupError(`Google returned HTTP ${status}. If access has expired, reconnect Google from setup.`, 502);
-  }
-  return response.json();
-}
-async function accessToken(env, link) {
-  const data = await googleJSON("https://oauth2.googleapis.com/token", {
-    method: "POST", body: new URLSearchParams({
-      client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET,
-      refresh_token: await decrypt(env, link.refresh_cipher), grant_type: "refresh_token",
-    }),
-  });
-  if (!data.access_token) throw new SetupError("Google did not return an access token.", 502);
-  return data.access_token;
-}
-
 function discordStatus(env, admin) {
   const missing = missingDiscordSettings(env);
   const endpoint = `${origin(env)}/discord`;
   const note = missing.length ? `<p>Missing in Cloudflare: <code>${escape(missing.join(", "))}</code></p>` : "<p>All Discord and Gemini settings are present.</p>";
-  return `${note}<p>Interactions Endpoint URL for the Discord Developer Portal: <code>${escape(endpoint)}</code></p><form method='post' action='/admin/register-discord'>${csrf(admin)}<button>Register Discord commands</button></form><h2>Siri</h2><p>Ask Gemini by voice with an iPhone Shortcut. Answers are spoken and also posted to the Discord channel chosen in <code>/panel</code>.</p><form method='post' action='/admin/pair-siri'>${csrf(admin)}<button>Create Siri key</button></form><p>Creating a key replaces the previous Siri key.</p>`;
+  return `${note}<p>Interactions Endpoint URL for the Discord Developer Portal: <code>${escape(endpoint)}</code></p><form method='post' action='/admin/register-discord'>${csrf(admin)}<button>Register Discord commands</button></form><h2>Siri</h2><p>Ask Gemini by voice with an iPhone Shortcut. Answers are spoken and also posted to the Discord channel chosen in <code>/panel</code>.</p><form method='post' action='/admin/pair-siri'>${csrf(admin)}<button>Create Siri key</button></form><p>Creating a key replaces the previous Siri key.</p><h2>Gmail deadlines</h2><p>A small Google Apps Script checks new Gmail every 15 minutes and sends it here; deadlines found go to the Agent calendar and Discord.</p><form method='post' action='/admin/pair-mail'>${csrf(admin)}<button>Create Gmail key and script</button></form>`;
 }
 async function handle(request, env, ctx) {
   const url = new URL(request.url);
   if (url.pathname === "/api/chat") return voiceChat(request, env);
   if (url.pathname === "/discord") return discordInteraction(request, env, ctx);
   if (url.pathname === "/api/siri") return siriAsk(request, env, ctx);
+  if (url.pathname === "/api/mail") return mailIngest(request, env, ctx);
   if (request.method === "GET" && url.pathname === "/health")
-    return reply(JSON.stringify({ service: "pocket-agent", stage: "discord-siri", online: true }), 200,
+    return reply(JSON.stringify({ service: "pocket-agent", stage: "deadlines", online: true }), 200,
       { "Content-Type": "application/json" });
   if (request.method === "GET" && url.pathname === "/") {
     return page("Pocket Agent is online", "<p>Your cloud service is running.</p><p><a href='/admin'>Open calendar setup</a></p><p>Voice chat is available after phone pairing. Calendar event commands and Obsidian delivery are not connected yet.</p>");
   }
   const routes = { "/admin": "GET", "/admin/login": "POST", "/admin/logout": "POST",
-    "/oauth/start": "POST", "/oauth/callback": "GET", "/admin/create-calendar": "POST", "/admin/pair-voice": "POST", "/admin/register-discord": "POST", "/admin/pair-siri": "POST" };
+    "/oauth/start": "POST", "/oauth/callback": "GET", "/admin/create-calendar": "POST", "/admin/pair-voice": "POST", "/admin/register-discord": "POST", "/admin/pair-siri": "POST", "/admin/pair-mail": "POST" };
   if (!routes[url.pathname]) return page("Not found", "<p>This endpoint is not available.</p>", 404);
   if (request.method !== routes[url.pathname]) return reply("Method not allowed", 405, { Allow: routes[url.pathname] });
   requireConfig(env);
@@ -205,6 +160,11 @@ async function handle(request, env, ctx) {
     await form(request, env, admin);
     const key = await pairSiri(db);
     return page("Siri key", `<p>Paste this key into your Siri shortcut, after <code>Bearer </code> in the Authorization header. It is shown only now and replaces the previous Siri key.</p><textarea readonly rows="3" style="width:100%;box-sizing:border-box;font:16px monospace" aria-label="Siri key">${escape(key)}</textarea><p>This key can only ask questions. It cannot open setup, change models, read Google Calendar or use the voice-chat key. Shortcuts stores it in plain text and may sync it through iCloud, so if your phone is lost, create a new key here to cancel the old one.</p><p>Address for the shortcut: <code>${escape(origin(env))}/api/siri</code></p><p><a href='/admin'>Return to setup</a></p>`);
+  }
+  if (url.pathname === "/admin/pair-mail") {
+    await form(request, env, admin);
+    const key = await pairMail(db);
+    return page("Gmail key", `<p>Copy the whole script below into Google Apps Script, following MAIL-SETUP.md. It contains your new Gmail key, shown only now; it replaces the previous Gmail key.</p><textarea readonly rows="16" style="width:100%;box-sizing:border-box;font:13px monospace" aria-label="Apps Script">${escape(appsScript(origin(env), key))}</textarea><p>The key can only send emails to Pocket Agent for deadline scanning. Email text is read by Cloudflare AI only and is not stored; Pocket Agent keeps the email ID to avoid duplicates, plus any deadlines found.</p><p><a href='/admin'>Return to setup</a></p>`);
   }
   if (url.pathname === "/admin/register-discord") {
     await form(request, env, admin);
@@ -304,6 +264,10 @@ async function handle(request, env, ctx) {
 }
 
 export default {
+  // Morning summary of upcoming deadlines (cron in wrangler.jsonc).
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(dailyDigest(env).catch(() => false));
+  },
   async fetch(request, env, ctx) {
     try { return await handle(request, env, ctx); }
     catch (error) {

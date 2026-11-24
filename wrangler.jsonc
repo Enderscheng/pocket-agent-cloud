@@ -21,5 +21,9 @@
   ],
   "ai": {
     "binding": "AI"
+  },
+  // 06:00 UTC = 07:00 Copenhagen in winter, 08:00 in summer.
+  "triggers": {
+    "crons": ["0 6 * * *"]
   }
 }

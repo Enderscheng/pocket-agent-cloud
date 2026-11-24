@@ -1,7 +1,9 @@
 // Siri → Gemini → spoken answer, with a copy posted to the Discord channel chosen in /panel.
+// The same key also lets Siri note a to-do ({"note": ...}) or read upcoming deadlines ({"agenda": true}).
 // Uses its own "Siri key" (ps1_...), which can only ask questions: it cannot change
 // models, reach setup, Google Calendar or the voice-chat key.
 import { askGemini, askCloudflare, currentModels, BusyError, DiscordError, siriChannel, postToChannel } from './discord.js';
+import { captureNote, agendaText, isChinese, TaskError } from './tasks.js';
 
 const encoder = new TextEncoder();
 const PER_MINUTE = 6;
@@ -82,15 +84,24 @@ export async function siriAsk(request, env, ctx) {
     if (!request.headers.get('Content-Type')?.toLowerCase().startsWith('application/json'))
       throw new SiriError('The shortcut must send JSON. Set Request Body to JSON.', 415);
     const body = await bodyJSON(request);
+    const note = typeof body?.note === 'string' ? body.note.trim() : '';
+    const agenda = body?.agenda === true || body?.agenda === 'true';
     const question = typeof body?.question === 'string' ? body.question.trim() : '';
-    if (!question || question.length > 1500) throw new SiriError('I did not catch a question. Please try again.');
+    if (!agenda && !note && (!question || question.length > 1500)) throw new SiriError('I did not catch a question. Please try again.');
+    if (note.length > 1500) throw new SiriError('That note is too long. Please keep it shorter.');
     const web = body.web === true || body.web === 'true';
-    if (!(env.GEMINI_API_KEY || '').trim()) throw new SiriError('Gemini is not set up yet.', 503);
+    if (!note && !agenda && !(env.GEMINI_API_KEY || '').trim()) throw new SiriError('Gemini is not set up yet.', 503);
     const now = new Date().toISOString();
     await allowance(db, 'minute:' + now.slice(0, 16), PER_MINUTE);
     await allowance(db, 'day:' + now.slice(0, 10), PER_DAY);
     await db.prepare("DELETE FROM siri_limits WHERE bucket < ? AND bucket LIKE 'minute:%'").bind('minute:' + now.slice(0, 10)).run();
     await db.prepare("DELETE FROM siri_limits WHERE bucket < ? AND bucket LIKE 'day:%'").bind('day:' + now.slice(0, 10)).run();
+
+    if (agenda) return json({ answer: await agendaText(env, body.language !== 'en') });
+    if (note) {
+      const answer = await captureNote(env, ctx, note);
+      return json({ answer });
+    }
 
     const style = ' This answer will be read aloud by Siri: use plain sentences with no markdown, lists or emoji, and keep it under about 80 words unless the user asks for detail.';
     const started = Date.now();
@@ -110,8 +121,9 @@ export async function siriAsk(request, env, ctx) {
     return json({ answer: speakable(text) || text, model, posted_to_discord: Boolean(channel) });
   } catch (error) {
     // Spoken by the shortcut, so keep it short. Never log questions, keys or model errors.
-    const message = error instanceof SiriError || error instanceof DiscordError ? error.message : 'Pocket Agent is unavailable right now.';
+    const known = error instanceof SiriError || error instanceof DiscordError || error instanceof TaskError;
+    const message = known ? error.message : 'Pocket Agent is unavailable right now.';
     // Always HTTP 200 so the shortcut reliably reads the message out instead of stopping silently.
-    return json({ answer: message, error: message, status: error instanceof SiriError || error instanceof DiscordError ? (error.status || 400) : 503 });
+    return json({ answer: message, error: message, status: known ? (error.status || 400) : 503 });
   }
 }
