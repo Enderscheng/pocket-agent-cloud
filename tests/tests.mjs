@@ -99,6 +99,7 @@ export async function runTests(worker) {
   };
   try {
     check((await send('/health', {}, {})).status === 200, 'Health should work before configuration');
+    check((await send('/privacy', {}, {})).status === 200, 'Privacy page should be public');
     check((await send('/admin', {}, {})).status === 503, 'Setup must fail closed before configuration');
     check((await send('/admin/create-calendar', { method: 'POST' })).status === 401, 'No anonymous creation');
     check((await send('/api/tasks', { method: 'POST' })).status === 404, 'No premature command endpoint');
