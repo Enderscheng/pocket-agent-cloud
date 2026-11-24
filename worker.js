@@ -1,6 +1,7 @@
 // Calendar setup, paired chat-only voice conversations and owner-only Discord /ask. No event-writing tools.
 import { pairVoice, voiceChat } from "./voice.js";
 import { discordInteraction, registerCommands, missingDiscordSettings, DiscordError } from "./discord.js";
+import { pairSiri, siriAsk } from "./siri.js";
 const CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.app.created";
 const SCOPES = `openid email ${CALENDAR_SCOPE}`;
 const COOKIE = "__Host-pocket-admin";
@@ -162,20 +163,21 @@ function discordStatus(env, admin) {
   const missing = missingDiscordSettings(env);
   const endpoint = `${origin(env)}/discord`;
   const note = missing.length ? `<p>Missing in Cloudflare: <code>${escape(missing.join(", "))}</code></p>` : "<p>All Discord and Gemini settings are present.</p>";
-  return `${note}<p>Interactions Endpoint URL for the Discord Developer Portal: <code>${escape(endpoint)}</code></p><form method='post' action='/admin/register-discord'>${csrf(admin)}<button>Register Discord commands</button></form>`;
+  return `${note}<p>Interactions Endpoint URL for the Discord Developer Portal: <code>${escape(endpoint)}</code></p><form method='post' action='/admin/register-discord'>${csrf(admin)}<button>Register Discord commands</button></form><h2>Siri</h2><p>Ask Gemini by voice with an iPhone Shortcut. Answers are spoken and also posted to the Discord channel chosen in <code>/panel</code>.</p><form method='post' action='/admin/pair-siri'>${csrf(admin)}<button>Create Siri key</button></form><p>Creating a key replaces the previous Siri key.</p>`;
 }
 async function handle(request, env, ctx) {
   const url = new URL(request.url);
   if (url.pathname === "/api/chat") return voiceChat(request, env);
   if (url.pathname === "/discord") return discordInteraction(request, env, ctx);
+  if (url.pathname === "/api/siri") return siriAsk(request, env, ctx);
   if (request.method === "GET" && url.pathname === "/health")
-    return reply(JSON.stringify({ service: "pocket-agent", stage: "discord-gemini", online: true }), 200,
+    return reply(JSON.stringify({ service: "pocket-agent", stage: "discord-siri", online: true }), 200,
       { "Content-Type": "application/json" });
   if (request.method === "GET" && url.pathname === "/") {
     return page("Pocket Agent is online", "<p>Your cloud service is running.</p><p><a href='/admin'>Open calendar setup</a></p><p>Voice chat is available after phone pairing. Calendar event commands and Obsidian delivery are not connected yet.</p>");
   }
   const routes = { "/admin": "GET", "/admin/login": "POST", "/admin/logout": "POST",
-    "/oauth/start": "POST", "/oauth/callback": "GET", "/admin/create-calendar": "POST", "/admin/pair-voice": "POST", "/admin/register-discord": "POST" };
+    "/oauth/start": "POST", "/oauth/callback": "GET", "/admin/create-calendar": "POST", "/admin/pair-voice": "POST", "/admin/register-discord": "POST", "/admin/pair-siri": "POST" };
   if (!routes[url.pathname]) return page("Not found", "<p>This endpoint is not available.</p>", 404);
   if (request.method !== routes[url.pathname]) return reply("Method not allowed", 405, { Allow: routes[url.pathname] });
   requireConfig(env);
@@ -198,6 +200,11 @@ async function handle(request, env, ctx) {
     if (typeof env.AI?.run !== "function") throw new SetupError("Workers AI binding AI is missing. Wait for the voice-chat deployment to finish.", 503);
     const key = await pairVoice(db);
     return page("Pair voice chat", `<p>Copy this voice key into Pocket Agent → 設定. It is shown only now. It replaces the previous phone key.</p><textarea readonly rows="3" style="width:100%;box-sizing:border-box;font:16px monospace" aria-label="Voice key">${escape(key)}</textarea><p>This key allows chat only. It cannot sign in to setup, read Google Calendar, change events or access Obsidian.</p><p>Keep it private. If lost, create another key here.</p><p><a href='/admin'>Return to setup</a></p>`);
+  }
+  if (url.pathname === "/admin/pair-siri") {
+    await form(request, env, admin);
+    const key = await pairSiri(db);
+    return page("Siri key", `<p>Paste this key into your Siri shortcut, after <code>Bearer </code> in the Authorization header. It is shown only now and replaces the previous Siri key.</p><textarea readonly rows="3" style="width:100%;box-sizing:border-box;font:16px monospace" aria-label="Siri key">${escape(key)}</textarea><p>This key can only ask questions. It cannot open setup, change models, read Google Calendar or use the voice-chat key. Shortcuts stores it in plain text and may sync it through iCloud, so if your phone is lost, create a new key here to cancel the old one.</p><p>Address for the shortcut: <code>${escape(origin(env))}/api/siri</code></p><p><a href='/admin'>Return to setup</a></p>`);
   }
   if (url.pathname === "/admin/register-discord") {
     await form(request, env, admin);

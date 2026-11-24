@@ -1,5 +1,6 @@
 // Discord slash commands for the owner only: /ask sends one question to Gemini,
-// /model picks the Gemini model and /usage shows today's request counts.
+// /model picks the Gemini model, /usage shows today's request counts and /panel is a
+// button-and-menu control panel for the same settings plus the Siri channel.
 // No calendar, Google account, notes or voice-key access is reachable from here.
 import { answerText } from './voice.js';
 const API = 'https://discord.com/api/v10';
@@ -30,6 +31,8 @@ export const COMMANDS = [{
   ],
 }, {
   name: 'usage', type: 1, description: 'Show how many AI requests Pocket Agent made today',
+}, {
+  name: 'panel', type: 1, description: 'Open the Pocket Agent control panel (models, usage, Siri)',
 }];
 const LIMITS_URL = 'https://aistudio.google.com/usage';
 
@@ -99,7 +102,7 @@ export function splitMessage(text) {
 
 const BUSY_STATUS = new Set([500, 502, 503, 504]);
 // Temporary trouble (overload, rate limit, timeout): worth trying another model.
-class BusyError extends DiscordError {}
+export class BusyError extends DiscordError {}
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 function modelName(value) {
   const model = String(value || '').trim();
@@ -110,7 +113,7 @@ function modelName(value) {
 // ---- Saved model choice and usage counts (D1) ----
 const SETTINGS_TABLE = 'CREATE TABLE IF NOT EXISTS discord_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)';
 const USAGE_TABLE = 'CREATE TABLE IF NOT EXISTS ai_usage (day TEXT NOT NULL, model TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, limited INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, model))';
-function database(env) { return typeof env.DB?.withSession === 'function' ? env.DB.withSession('first-primary') : null; }
+export function database(env) { return typeof env.DB?.withSession === 'function' ? env.DB.withSession('first-primary') : null; }
 const today = () => new Date().toISOString().slice(0, 10);
 // Discord setting wins over the Cloudflare variable, which wins over the default.
 export async function currentModels(env) {
@@ -196,10 +199,10 @@ async function geminiOnce(env, model, body, timeout) {
 // Tries the main model, retries it once if overloaded, then the lighter model.
 // Discord allows about 30 seconds of background work, so every step respects a deadline.
 // Returns { text, model } so the reply can say which model answered.
-export async function askGemini(env, question, web, deadline = Date.now() + 20000, models = null) {
+export async function askGemini(env, question, web, deadline = Date.now() + 20000, models = null, extra = '') {
   const { main: primary, backup: fallback } = models || await currentModels(env);
   const body = {
-    systemInstruction: { parts: [{ text: systemPrompt(env) }] },
+    systemInstruction: { parts: [{ text: systemPrompt(env, extra) }] },
     contents: [{ role: 'user', parts: [{ text: question }] }],
     generationConfig: { maxOutputTokens: 2048, temperature: 0.6 },
   };
@@ -221,14 +224,14 @@ export async function askGemini(env, question, web, deadline = Date.now() + 2000
 }
 
 // Free backup: the Cloudflare Workers AI model already used for voice chat.
-export async function askCloudflare(env, question, deadline) {
+export async function askCloudflare(env, question, deadline, extra = '') {
   const left = deadline - Date.now();
   if (left < 2000) throw new Error('no time left');
   let timer;
   await recordUsage(env, 'cloudflare-ai');
   const result = await Promise.race([
     env.AI.run(CLOUDFLARE_MODEL, {
-      messages: [{ role: 'system', content: systemPrompt(env, ' You cannot search the web.') }, { role: 'user', content: question }],
+      messages: [{ role: 'system', content: systemPrompt(env, extra + ' You cannot search the web.') }, { role: 'user', content: question }],
       max_completion_tokens: 900, temperature: 0.6, stream: false, chat_template_kwargs: { enable_thinking: false },
     }),
     new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), left); }),
@@ -299,32 +302,63 @@ async function setModel(env, name, backup) {
   const info = await response.json();
   if (!(info.supportedGenerationMethods || []).includes('generateContent'))
     throw new DiscordError(`\`${id}\` can't answer chat questions. Pick another from /model list.`);
+  await saveSetting(env, backup ? 'backup' : 'model', id);
+  return `Saved. /ask now uses \`${id}\` as its ${backup ? 'backup' : 'main'} model.\n\n${describeModels(await currentModels(env))}`;
+}
+async function saveSetting(env, key, value) {
   const db = database(env);
   if (!db) throw new DiscordError('The database is not connected, so the choice cannot be saved.');
   try {
     await db.prepare('INSERT INTO discord_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
-      .bind(backup ? 'backup' : 'model', id).run();
+      .bind(key, value).run();
   } catch { throw new DiscordError('Could not save the choice. Open /admin and tap Register Discord commands once, then try again.'); }
-  return `Saved. /ask now uses \`${id}\` as its ${backup ? 'backup' : 'main'} model.\n\n${describeModels(await currentModels(env))}`;
+}
+// The channel where Siri questions and answers are posted, set from /panel.
+export async function siriChannel(env) {
+  const db = database(env);
+  if (!db) return null;
+  try {
+    const row = await db.prepare("SELECT value FROM discord_settings WHERE key = 'siri_channel'").first();
+    return /^\d{15,22}$/.test(row?.value || '') ? row.value : null;
+  } catch { return null; }
+}
+// Posts as the bot. Needs View Channel and Send Messages in that channel.
+export async function postToChannel(env, channelId, text) {
+  if (!/^\d{15,22}$/.test(channelId || '') || !(env.DISCORD_BOT_TOKEN || '').trim()) return false;
+  let ok = true;
+  for (const chunk of splitMessage(text)) {
+    try {
+      const response = await fetch(`${API}/channels/${channelId}/messages`, {
+        method: 'POST', signal: AbortSignal.timeout(8000),
+        headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN.trim()}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: chunk, allowed_mentions: { parse: [] } }),
+      });
+      ok &&= response.ok;
+    } catch { ok = false; }
+  }
+  return ok;
 }
 async function resetModels(env) {
   const db = database(env);
   if (db) { try { await db.prepare("DELETE FROM discord_settings WHERE key IN ('model', 'backup')").run(); } catch { /* nothing saved yet */ } }
   return `Back to the defaults.\n\n${describeModels(await currentModels(env))}`;
 }
-async function usageReport(env) {
+async function usageRows(env) {
   const db = database(env);
-  let rows = [];
-  if (db) {
-    try {
-      // Keep about a month of counts.
-      await db.prepare('DELETE FROM ai_usage WHERE day < ?').bind(new Date(Date.now() - 35 * 86400000).toISOString().slice(0, 10)).run();
-      rows = (await db.prepare('SELECT model, requests, limited FROM ai_usage WHERE day = ? ORDER BY requests DESC').bind(today()).all()).results || [];
-    } catch { /* table not created yet */ }
-  }
-  const body = rows.length
+  if (!db) return [];
+  try {
+    // Keep about a month of counts.
+    await db.prepare('DELETE FROM ai_usage WHERE day < ?').bind(new Date(Date.now() - 35 * 86400000).toISOString().slice(0, 10)).run();
+    return (await db.prepare('SELECT model, requests, limited FROM ai_usage WHERE day = ? ORDER BY requests DESC').bind(today()).all()).results || [];
+  } catch { return []; /* table not created yet */ }
+}
+function usageLines(rows) {
+  return rows.length
     ? rows.map(r => `• \`${r.model}\`: ${r.requests} request${r.requests === 1 ? '' : 's'}${r.limited ? ` (${r.limited} hit the free limit)` : ''}`).join('\n')
     : 'No AI requests yet today.';
+}
+async function usageReport(env) {
+  const body = usageLines(await usageRows(env));
   return `**AI requests today** (${today()}, UTC)\n${body}\n\n` +
     `-# Counted by Pocket Agent; retries count separately. Google doesn't report remaining quota to apps, so check your limits and usage at <${LIMITS_URL}>. Free limits reset daily (Pacific time).`;
 }
@@ -338,6 +372,82 @@ async function autocomplete(env, interaction) {
   return json({ type: 8, data: { choices } });
 }
 
+// ---- /panel: one private message with menus and buttons ----
+async function editOriginal(env, token, payload) {
+  try {
+    await fetch(`${API}/webhooks/${env.DISCORD_APPLICATION_ID}/${token}/messages/@original`, {
+      method: 'PATCH', signal: AbortSignal.timeout(10000), headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ allowed_mentions: { parse: [] }, ...payload }),
+    });
+  } catch { /* Discord unreachable. Never log content or tokens. */ }
+}
+export async function panelMessage(env, note = '') {
+  const [current, rows, channel] = await Promise.all([currentModels(env), usageRows(env), siriChannel(env)]);
+  let models = [], listProblem = '';
+  if ((env.GEMINI_API_KEY || '').trim()) {
+    try { models = await listModels(env, 2500); } catch { listProblem = "Couldn't load Google's model list just now; press Refresh."; }
+  }
+  // Chosen models first so they always appear, even past Discord's 25-option limit.
+  const seen = new Set();
+  const ordered = [{ id: current.main, label: 'Current main model' }, { id: current.backup, label: 'Current backup model' }, ...models]
+    .filter(m => !seen.has(m.id) && seen.add(m.id)).map(m => models.find(x => x.id === m.id) || m).slice(0, 25);
+  const options = selected => ordered.map(m => ({ label: m.id.slice(0, 100), description: m.label.slice(0, 100), value: m.id, default: m.id === selected }));
+  const embed = {
+    title: 'Pocket Agent control panel', color: 0x174ab9,
+    fields: [
+      { name: 'Main model', value: `\`${current.main}\`\n-# ${current.mainSource}`, inline: true },
+      { name: 'Backup model', value: `\`${current.backup}\`\n-# ${current.backupSource}`, inline: true },
+      { name: 'Siri answers go to', value: channel ? `<#${channel}>` : 'Not set: press **Send Siri answers here** in the channel you want.', inline: false },
+      { name: `Requests today (${today()} UTC)`, value: usageLines(rows).slice(0, 1000), inline: false },
+    ],
+    footer: { text: `${listProblem ? listProblem + ' ' : ''}Google doesn't share remaining quota with apps: use "Quota on Google" to see it.`.slice(0, 2000) },
+  };
+  const components = [];
+  if (ordered.length) {
+    components.push({ type: 1, components: [{ type: 3, custom_id: 'panel:main', placeholder: 'Choose the main model', options: options(current.main) }] });
+    components.push({ type: 1, components: [{ type: 3, custom_id: 'panel:backup', placeholder: 'Choose the backup model', options: options(current.backup) }] });
+  }
+  components.push({ type: 1, components: [
+    { type: 2, style: 2, custom_id: 'panel:refresh', label: 'Refresh', emoji: { name: '🔄' } },
+    { type: 2, style: 1, custom_id: 'panel:siri', label: 'Send Siri answers here', emoji: { name: '🎙️' } },
+    { type: 2, style: 4, custom_id: 'panel:reset', label: 'Reset models' },
+    { type: 2, style: 5, url: LIMITS_URL, label: 'Quota on Google' },
+  ] });
+  return { content: note, embeds: [embed], components };
+}
+async function panelAction(env, interaction) {
+  const id = interaction.data?.custom_id;
+  if (id === 'panel:main' || id === 'panel:backup') {
+    const value = String(interaction.data.values?.[0] || '');
+    const current = await currentModels(env);
+    let offered = [];
+    try { offered = await listModels(env, 2500); } catch { /* checked below */ }
+    if (!offered.some(m => m.id === value) && value !== current.main && value !== current.backup)
+      return panelMessage(env, '⚠️ That model is not offered any more. Press Refresh.');
+    await saveSetting(env, id === 'panel:main' ? 'model' : 'backup', value);
+    return panelMessage(env, `✅ ${id === 'panel:main' ? 'Main' : 'Backup'} model is now \`${value}\`.`);
+  }
+  if (id === 'panel:reset') { await resetModels(env); return panelMessage(env, '✅ Models reset to the defaults.'); }
+  if (id === 'panel:siri') {
+    const channel = String(interaction.channel_id || '');
+    if (!/^\d{15,22}$/.test(channel)) return panelMessage(env, '⚠️ Open the panel inside a server channel to choose it for Siri.');
+    await saveSetting(env, 'siri_channel', channel);
+    const posted = await postToChannel(env, channel, '🎙️ Siri questions and answers will be posted in this channel.');
+    return panelMessage(env, posted ? '✅ Siri answers will be posted in this channel.'
+      : "⚠️ Saved, but the bot couldn't post here. Give the Pocket Agent bot View Channel and Send Messages in this channel.");
+  }
+  return panelMessage(env, id === 'panel:refresh' ? '🔄 Refreshed.' : '');
+}
+async function panelUpdate(env, token, work) {
+  let payload;
+  try { payload = await work(); }
+  catch (error) {
+    const note = `⚠️ ${error instanceof DiscordError ? error.message : 'Something went wrong. Please try again.'}`;
+    try { payload = await panelMessage(env, note); } catch { payload = { content: note, embeds: [], components: [] }; }
+  }
+  await editOriginal(env, token, payload);
+}
+
 export async function discordInteraction(request, env, ctx) {
   try {
     if (request.method !== 'POST') return json({ error: 'Use POST.' }, 405);
@@ -347,7 +457,7 @@ export async function discordInteraction(request, env, ctx) {
     let interaction;
     try { interaction = JSON.parse(body); } catch { throw new DiscordError('Invalid JSON.'); }
     if (interaction.type === 1) return json({ type: 1 });
-    if (interaction.type !== 2 && interaction.type !== 4) return json({ error: 'Unsupported interaction.' }, 400);
+    if (![2, 3, 4].includes(interaction.type)) return json({ error: 'Unsupported interaction.' }, 400);
     if (String(interaction.application_id) !== String(env.DISCORD_APPLICATION_ID)) return json({ error: 'Wrong application.' }, 400);
     const userId = interaction.member?.user?.id ?? interaction.user?.id;
     const owner = (env.DISCORD_ALLOWED_USER_ID || '').trim();
@@ -358,8 +468,15 @@ export async function discordInteraction(request, env, ctx) {
       return autocomplete(env, interaction);
     }
     if (!isOwner) return ephemeral('Sorry, this Pocket Agent only answers its owner.');
-    if (!['ask', 'model', 'usage'].includes(name)) return ephemeral('Unknown command. Re-register commands from the setup page.');
     if (typeof interaction.token !== 'string' || !/^[\w.-]{20,500}$/.test(interaction.token)) return json({ error: 'Invalid token.' }, 400);
+    if (interaction.type === 3) {
+      if (!/^panel:(main|backup|refresh|reset|siri)$/.test(interaction.data?.custom_id || '')) return ephemeral('This button is out of date. Open /panel again.');
+      // Acknowledge now; the panel message is edited in place once the change is saved.
+      ctx.waitUntil(panelUpdate(env, interaction.token, () => panelAction(env, interaction)));
+      return json({ type: 6 });
+    }
+    if (!['ask', 'model', 'usage', 'panel'].includes(name)) return ephemeral('Unknown command. Re-register commands from the setup page.');
+    if (name === 'panel') { ctx.waitUntil(panelUpdate(env, interaction.token, () => panelMessage(env))); return DEFER_PRIVATE(); }
     if (name === 'usage') return ephemeral(await usageReport(env));
     if (name === 'model') {
       const sub = interaction.data.options?.[0];
@@ -394,7 +511,7 @@ export async function registerCommands(env) {
   if (missing.length) throw new DiscordError(`Add these settings in Cloudflare first: ${missing.join(', ')}.`, 503);
   const db = database(env);
   if (!db) throw new DiscordError('The D1 database binding DB is missing.', 503);
-  // Tables for /model and /usage; safe to run again.
+  // Tables for /model, /usage and /panel; safe to run again.
   await db.prepare(SETTINGS_TABLE).run();
   await db.prepare(USAGE_TABLE).run();
   let response;
