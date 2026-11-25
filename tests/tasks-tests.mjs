@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { parseItems, eventBody, describeDue, localNow, dailyDigest } from '../tasks.js';
-import { pairSiri } from '../siri.js';
+import { pairSiri, wantsAgenda } from '../siri.js';
 import { pairMail, appsScript } from '../mail.js';
 import { encrypt } from '../google.js';
 
@@ -157,6 +157,16 @@ export async function runTaskTests(worker) {
 
     r = await post('/api/siri', { agenda: true }, siriKey);
     check(r.data.answer.startsWith('未來 7 日有') && r.data.answer.includes('交 FYP 報告'), 'Siri reads upcoming deadlines');
+
+    db.limits.clear(); calls.length = 0;
+    r = await post('/api/siri', { question: '我最近有乜嘢要做？' }, siriKey);
+    check(r.data.answer.startsWith('未來 7 日有') && !calls.some(c => c.url.includes('generativelanguage')), '問助手 to-do question answered from saved deadlines, not Gemini');
+    const agendaPost = channelPosts().at(-1);
+    check(agendaPost?.content.includes('我最近有乜嘢要做') && agendaPost.content.includes('**交 FYP 報告**'), 'To-do question and the 7-day list are posted to Discord');
+    r = await post('/api/siri', { question: "What's due this week?" }, siriKey);
+    check(r.data.answer.includes('next 7 days'), 'English to-do question gets an English answer');
+    check(['今個星期有咩功課要交', '聽日有咩要做', '我有咩deadline', 'What do I have to do this week?', 'what is on my calendar'].every(wantsAgenda), 'To-do questions are recognised');
+    check(!['點樣整蛋糕要做咩準備？', 'What is the capital of France?', 'How do I do push-ups?', '香港有咩好玩'].some(wantsAgenda), 'Ordinary questions still go to Gemini');
 
     // ---- Gmail ingest ----
     check((await post('/api/mail', { id: 'm1' })).status === 401, 'Mail endpoint needs a key');

@@ -47,6 +47,7 @@ Tap ▶︎ once inside Shortcuts. Allow the microphone and the connection to `po
 ## 4. Use it
 
 - "Hey Siri, Ask Pocket Agent" → speak → pause. Siri reads the answer, and the full version appears in your Discord channel.
+- Ask about your own to-dos, for example 「我最近有乜嘢要做？」, 「今個星期有咩功課要交？」 or "What's due this week?": Pocket Agent reads the deadlines for the next 7 days (from 記低 notes and email) instead of asking Gemini, and posts the list in Discord. It reads only items Pocket Agent added, not your other calendars.
 - **While the phone is locked:** turn on **Settings → Siri → Allow Siri When Locked**. Shortcuts that dictate and use the internet usually run from the lock screen, but iOS may ask you to unlock for some actions. Test it on your phone.
 
 ## Troubleshooting

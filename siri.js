@@ -3,7 +3,7 @@
 // Uses its own "Siri key" (ps1_...), which can only ask questions: it cannot change
 // models, reach setup, Google Calendar or the voice-chat key.
 import { askGemini, askCloudflare, currentModels, BusyError, DiscordError, siriChannel, postToChannel } from './discord.js';
-import { captureNote, agendaText, isChinese, TaskError } from './tasks.js';
+import { captureNote, agendaText, agendaMarkdown, isChinese, TaskError } from './tasks.js';
 
 const encoder = new TextEncoder();
 const PER_MINUTE = 6;
@@ -62,6 +62,30 @@ export function speakable(text) {
     .trim();
 }
 
+// 問助手 questions about the user's own to-dos ("我最近有乜嘢要做？") are answered from the
+// saved deadlines instead of Gemini, which cannot see the calendar. Short questions only,
+// so general questions such as how to cook something still go to Gemini.
+const AGENDA_PATTERNS = [
+  /(我|最近|今日|聽日|後日|今個?星期|呢個?星期|下個?星期|今個月|未來|呢幾日|呢排|這幾天|最近).{0,8}(有(咩|乜|乜嘢|啲乜|啲咩|什麼|甚麼|冇)|要做|做咩|做乜|要交|deadline|死線|行程|活動|安排|功課|事做)/i,
+  /有(咩|乜嘢?|啲乜嘢?|啲咩|什麼|甚麼).{0,4}(要做|要交|deadline|死線|行程|活動|安排|功課)/i,
+  /(行程|日程|deadline|死線|to-?do).{0,6}(係咩|有咩|有乜|點|是什麼)/i,
+  /\b(what|anything|do i have|have i got).{0,25}\b(to ?do|due|deadlines?|schedule|agenda|plans|events|on my calendar)\b/i,
+  /\bmy (schedule|agenda|calendar|deadlines|to-?dos?)\b/i,
+];
+export function wantsAgenda(question) {
+  return question.length <= 80 && AGENDA_PATTERNS.some(p => p.test(question));
+}
+async function agendaReply(env, ctx, chinese, asked) {
+  const answer = await agendaText(env, chinese);
+  const channel = await siriChannel(env);
+  if (channel) {
+    const quoted = asked ? `🎙️ **Siri:** ${asked.slice(0, 300).replace(/\n/g, ' ')}\n\n` : '🎙️ ';
+    ctx.waitUntil(agendaMarkdown(env, 7).then(list =>
+      postToChannel(env, channel, `${quoted}**未來 7 日要做嘅嘢**\n${list}\n-# 🔴 今日 · 🟠 聽日 · ⚠️ 未加入日曆 · via Siri`)).catch(() => {}));
+  }
+  return json({ answer, posted_to_discord: Boolean(channel) });
+}
+
 export async function siriAsk(request, env, ctx) {
   try {
     if (request.method !== 'POST') return json({ error: 'Use POST.' }, 405);
@@ -85,8 +109,8 @@ export async function siriAsk(request, env, ctx) {
       throw new SiriError('The shortcut must send JSON. Set Request Body to JSON.', 415);
     const body = await bodyJSON(request);
     const note = typeof body?.note === 'string' ? body.note.trim() : '';
-    const agenda = body?.agenda === true || body?.agenda === 'true';
     const question = typeof body?.question === 'string' ? body.question.trim() : '';
+    const agenda = body?.agenda === true || body?.agenda === 'true' || (!body?.note && wantsAgenda(question));
     if (!agenda && !note && (!question || question.length > 1500)) throw new SiriError('I did not catch a question. Please try again.');
     if (note.length > 1500) throw new SiriError('That note is too long. Please keep it shorter.');
     const web = body.web === true || body.web === 'true';
@@ -97,7 +121,7 @@ export async function siriAsk(request, env, ctx) {
     await db.prepare("DELETE FROM siri_limits WHERE bucket < ? AND bucket LIKE 'minute:%'").bind('minute:' + now.slice(0, 10)).run();
     await db.prepare("DELETE FROM siri_limits WHERE bucket < ? AND bucket LIKE 'day:%'").bind('day:' + now.slice(0, 10)).run();
 
-    if (agenda) return json({ answer: await agendaText(env, body.language !== 'en') });
+    if (agenda) return agendaReply(env, ctx, question ? isChinese(question) : body.language !== 'en', question);
     if (note) {
       const answer = await captureNote(env, ctx, note);
       return json({ answer });
