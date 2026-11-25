@@ -80,10 +80,20 @@ Apps Script 係喺**你自己 Gmail 帳戶入面**運行嘅細程式，免費，
 - 有錯誤嘅話，撳左邊 **執行項目**（Executions）就睇到。
 
 **私隱：**
-- 電郵內容只會交畀 **Cloudflare AI** 分析，唔會交畀 Gemini。
+- 電郵內容同 PDF／Word 附件只會交畀 **Cloudflare AI** 分析，唔會交畀 Gemini。
 - Pocket Agent **唔會儲存電郵內容**，只會記住電郵編號（避免重複處理）同搵到嘅 deadline。
 - Discord 通知只會顯示**標題同寄件人**。
 - 推廣（Promotions）同社交（Social）類別嘅電郵會自動略過。
+
+**PDF 同 Word 附件：**
+- 每封電郵最多睇 3 個 PDF 或者 Word 附件（每個最多 3 MB），連埋電郵內文一齊搵 deadline。
+- 有附件嘅電郵，Discord 都會出一個「📎 Email 有附件，記得睇」，列出每個附件有冇讀到，仲有一條連結喺 Gmail 打開。
+- 讀唔到嘅：舊式 Word（.doc）、掃描出嚟嘅 PDF（即係圖片）、超過 3 MB 嘅檔案。呢啲都會提你自己打開睇。
+
+**更新程式（2026-11-25 之前裝嘅要做一次，先會睇附件）：**
+1. 喺 `/admin` 再撳一次 **Create Gmail key and script**，全選拷貝新程式碼（舊密鑰會即時失效）。
+2. 打開 https://script.google.com → **Pocket Agent** 專案，**全選刪除**舊程式碼，貼上新嘅，撳 💾 儲存。
+3. 函式選單揀 **setup** → **▶ 執行**。如果 Google 再問權限，同上面 C 步一樣允許。
 
 ---
 

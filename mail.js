@@ -1,10 +1,13 @@
 // /api/mail: a Google Apps Script in the user's Gmail sends one new email per request.
 // Uses its own "mail key" (pm1_...), which can only submit emails for deadline scanning.
+// PDF and Word attachments come along and are read by Cloudflare Workers AI only.
 import { ingestMail, TaskError } from './tasks.js';
 
 const encoder = new TextEncoder();
 const PER_MINUTE = 30;
 const PER_DAY = 400;
+// Room for up to 3 attachments of 3 MB each, base64-encoded by the Apps Script.
+const MAX_BODY = 13 * 1024 * 1024;
 class MailError extends Error {
   constructor(message, status = 400) { super(message); this.status = status; }
 }
@@ -35,6 +38,23 @@ const POCKET_AGENT_URL = '${base}/api/mail';
 const POCKET_AGENT_KEY = '${key}';
 // Which emails to check. Promotions and social mail are skipped.
 const SEARCH = 'in:inbox newer_than:2d -category:promotions -category:social';
+// PDF and Word attachments are sent too (up to 3, 3 MB each) so dates inside them are found.
+const MAX_FILES = 3;
+const MAX_FILE_BYTES = 3 * 1024 * 1024;
+
+function attachments(message) {
+  const files = [];
+  for (const file of message.getAttachments({ includeInlineImages: false })) {
+    const name = file.getName() || '';
+    const type = /\\.pdf$/i.test(name) || file.getContentType() === 'application/pdf' ? 'pdf'
+      : /\\.docx$/i.test(name) ? 'docx' : /\\.doc$/i.test(name) ? 'doc' : '';
+    if (!type || files.length >= MAX_FILES) continue;
+    const small = file.getSize() <= MAX_FILE_BYTES;
+    files.push({ name: name.slice(0, 150), type: type, size: file.getSize(),
+      data: small && type !== 'doc' ? Utilities.base64Encode(file.getBytes()) : '' });
+  }
+  return files;
+}
 
 function setup() {
   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
@@ -55,7 +75,8 @@ function checkMail() {
         method: 'post', contentType: 'application/json', muteHttpExceptions: true,
         headers: { Authorization: 'Bearer ' + POCKET_AGENT_KEY },
         payload: JSON.stringify({ source: 'gmail', id: message.getId(), from: message.getFrom(),
-          subject: message.getSubject(), date: message.getDate().toISOString(), body: message.getPlainBody().slice(0, 6000) }),
+          subject: message.getSubject(), date: message.getDate().toISOString(), body: message.getPlainBody().slice(0, 6000),
+          attachments: attachments(message) }),
       });
       if (response.getResponseCode() !== 200) {
         // Stop and retry these emails next time.
@@ -79,7 +100,7 @@ async function bodyJSON(request) {
     const { done, value } = await reader.read();
     if (done) break;
     size += value.byteLength;
-    if (size > 65536) { await reader.cancel(); throw new MailError('Email is too large.', 413); }
+    if (size > MAX_BODY) { await reader.cancel(); throw new MailError('Email is too large.', 413); }
     text += decoder.decode(value, { stream: true });
   }
   try { return JSON.parse(text + decoder.decode()); } catch { throw new MailError('Invalid JSON.'); }

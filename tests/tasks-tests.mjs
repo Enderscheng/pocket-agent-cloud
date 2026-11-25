@@ -79,7 +79,14 @@ export async function runTaskTests(worker) {
     aiPrompts.push(body.messages[0].content + '\n' + body.messages[1].content);
     if (aiFails) throw new Error('quota');
     return { choices: [{ message: { content: aiReply }, finish_reason: 'stop' }] };
+  }, async toMarkdown(file) {
+    markdownCalls.push(file);
+    const text = await file.blob.text();
+    if (text === 'SCANNED') return { name: file.name, format: 'markdown', data: '' };
+    if (text === 'BROKEN') return { name: file.name, format: 'error', error: 'bad file' };
+    return { name: file.name, format: 'markdown', data: 'Course outline. Essay 1 is due on 5 December, submit on Canvas.' };
   } };
+  const markdownCalls = [];
   const calls = [];
   let eventCounter = 0, rejectButtons = false, createCalendarStatus = 200;
   const deletedEvents = new Map();
@@ -219,8 +226,31 @@ export async function runTaskTests(worker) {
     aiReply = '{"items":[]}';
     r = await post('/api/mail', { ...mail, id: 'msg-3' }, mailKey);
     check(r.data.added === 0, 'Emails without deadlines add nothing');
+    // ---- Email attachments ----
+    const b64 = text => Buffer.from(text).toString('base64');
+    aiReply = JSON.stringify({ items: [{ title: 'Submit Essay 1', due_date: plusDays(today, 9), due_time: null, notes: 'From outline.pdf', category: 'study' }] });
+    calls.length = 0; aiPrompts.length = 0; markdownCalls.length = 0; db.limits.clear();
+    r = await post('/api/mail', { ...mail, id: 'AbC123def456', subject: 'Course info', body: 'See attached.', attachments: [
+      { name: 'outline.pdf', type: 'pdf', data: b64('PDFDATA') },
+      { name: 'scan.pdf', type: 'pdf', data: b64('SCANNED') },
+      { name: 'old.doc', type: 'doc', data: '' },
+      { name: 'extra.docx', type: 'docx', data: b64('x') }] }, mailKey);
+    check(r.status === 200 && r.data.added === 1 && r.data.attachments === 3, 'Email with attachments: up to 3 read and the deadline added');
+    check(markdownCalls.length === 2 && markdownCalls[0].blob.type === 'application/pdf' && aiPrompts.at(-1).includes('--- Attachment: outline.pdf ---') && aiPrompts.at(-1).includes('due on 5 December') && !aiPrompts.at(-1).includes('scan.pdf ---'), 'Attachment text goes to Cloudflare AI with the email; unreadable files are left out');
+    check(!calls.some(c => c.url.includes('generativelanguage')), 'Attachments never go to Gemini');
+    const reminder = channelPosts().find(p => p.content.startsWith('📎'));
+    check(reminder && reminder.content.includes('outline.pdf — 已經幫你讀咗') && reminder.content.includes('scan.pdf — ⚠️ 讀唔到') && reminder.content.includes('old.doc — ⚠️ 舊式 Word') && reminder.content.includes('搵到 1 個 deadline') && reminder.content.includes('#all/AbC123def456'), 'Discord reminds to read each attachment, with a Gmail link');
+    aiReply = '{"items":[]}'; markdownCalls.length = 0;
+    r = await post('/api/mail', { ...mail, id: 'msg-att-2', attachments: [{ name: 'x.docx', type: 'docx', data: b64('BROKEN') }, { name: 'evil.exe', type: 'exe', data: b64('x') }] }, mailKey);
+    const reminder2 = channelPosts().filter(p => p.content.startsWith('📎')).at(-1);
+    check(r.data.attachments === 1 && reminder2.content.includes('x.docx — ⚠️ 讀唔到') && reminder2.content.includes('冇搵到 deadline') && !reminder2.content.includes('evil.exe') && !reminder2.content.includes('Gmail 打開'), 'Unreadable Word file still gets a reminder; other file types ignored');
+    r = await post('/api/mail', { ...mail, id: 'msg-att-3' }, mailKey);
+    check(channelPosts().filter(p => p.content.startsWith('📎')).length === 2, 'No attachment reminder for emails without attachments');
+
     const script = appsScript(base, mailKey);
     check(script.includes(`'${base}/api/mail'`) && script.includes(mailKey) && script.includes('everyMinutes(15)'), 'Apps Script filled in with address and key');
+    check(script.includes('/\\.pdf$/i') && script.includes('attachments: attachments(message)') && !script.includes('${'), 'Apps Script sends PDF and Word attachments');
+    new Function(script.replace(/^const /gm, 'var '));
 
     // ---- Categories ----
     calls.length = 0;
