@@ -3,7 +3,7 @@
 // Uses its own "Siri key" (ps1_...), which can only ask questions: it cannot change
 // models, reach setup, Google Calendar or the voice-chat key.
 import { askGemini, askCloudflare, currentModels, BusyError, DiscordError, siriChannel, postToChannel } from './discord.js';
-import { captureNote, agendaText, agendaMarkdown, isChinese, TaskError } from './tasks.js';
+import { captureNote, agendaText, agendaMarkdown, isChinese, syncQuietly, TaskError } from './tasks.js';
 
 const encoder = new TextEncoder();
 const PER_MINUTE = 6;
@@ -76,6 +76,7 @@ export function wantsAgenda(question) {
   return question.length <= 80 && AGENDA_PATTERNS.some(p => p.test(question));
 }
 async function agendaReply(env, ctx, chinese, asked) {
+  await syncQuietly(env, 7);
   const answer = await agendaText(env, chinese);
   const channel = await siriChannel(env);
   if (channel) {

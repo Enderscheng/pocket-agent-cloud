@@ -413,9 +413,38 @@ export async function agendaMarkdown(env, days = 7) {
   if (!tasks.length) return `未來 ${days} 日冇 deadline 🎉`;
   return tasks.map(t => `${t.due_date === today ? '🔴' : t.due_date === addDays(today, 1) ? '🟠' : '•'} ${category(t.category) ? category(t.category).emoji + ' ' : ''}**${t.title}** — ${describeDue(t, true)}${t.event_id ? '' : ' ⚠️'}`).join('\n');
 }
+// Items deleted by hand in Google or Apple Calendar: mark them cancelled so they stop
+// appearing in /todo, the morning summary and Siri. Only a clear "gone" from Google
+// cancels an item; any error leaves it as it is.
+async function eventGone(token, calendarId, eventId) {
+  const response = await googleFetch(token, eventsUrl(calendarId, `/${encodeURIComponent(eventId)}`));
+  if (response.status === 404 || response.status === 410) return true;
+  if (!response.ok) return false;
+  return (await response.json()).status === 'cancelled';
+}
+export async function syncDeleted(env, days = 14, limit = 40) {
+  const database_ = db(env);
+  await ensureTaskTables(database_);
+  const today = localNow(timeZone(env)).date;
+  const rows = (await database_.prepare("SELECT id, event_id, calendar_id FROM tasks WHERE status = 'active' AND event_id IS NOT NULL AND due_date >= ? AND due_date <= ? ORDER BY due_date LIMIT ?")
+    .bind(today, addDays(today, days), limit).all()).results || [];
+  if (!rows.length) return 0;
+  let link, token;
+  try { link = await calendarLink(env); token = await accessToken(env, link); } catch { return 0; }
+  const gone = await Promise.all(rows.map(row => eventGone(token, row.calendar_id || link.calendar_id, row.event_id).then(g => g && row.id, () => null)));
+  let removed = 0;
+  for (const id of gone.filter(Boolean)) {
+    await database_.prepare("UPDATE tasks SET status = 'cancelled' WHERE id = ? AND status = 'active'").bind(id).run();
+    removed++;
+  }
+  return removed;
+}
+export const syncQuietly = (env, days) => syncDeleted(env, days).catch(() => 0);
+
 export async function dailyDigest(env) {
   const channel = await siriChannel(env);
   if (!channel) return false;
+  await syncQuietly(env, 7);
   return postToChannel(env, channel, `☀️ **早晨！今日同未來 7 日要做嘅嘢**\n${await agendaMarkdown(env)}\n-# 🔴 今日 · 🟠 聽日 · ⚠️ 未加入日曆`);
 }
 export async function getTask(env, id) {
@@ -433,9 +462,14 @@ export async function editTask(env, id, { title, reminders }) {
     const prefs = await categorySettings(env, task.category);
     const link = await calendarLink(env);
     const token = await accessToken(env, link);
-    const response = await googleFetch(token, eventsUrl(task.calendar_id || link.calendar_id, `/${encodeURIComponent(task.event_id)}`), { method: 'PATCH',
+    const calendarId = task.calendar_id || link.calendar_id;
+    // Check first: changing a deleted Google event could bring it back.
+    if (await eventGone(token, calendarId, task.event_id)) {
+      await db(env).prepare("UPDATE tasks SET status = 'cancelled' WHERE id = ? AND status = 'active'").bind(id).run();
+      throw new TaskError('呢項已經喺日曆刪咗，所以已經由列表移走。', 404);
+    }
+    const response = await googleFetch(token, eventsUrl(calendarId, `/${encodeURIComponent(task.event_id)}`), { method: 'PATCH',
       body: JSON.stringify({ summary: `${prefs.icon ? prefs.icon + ' ' : ''}${name}`, reminders: { useDefault: false, overrides: reminders.map(minutes => ({ method: 'popup', minutes })) } }) });
-    if (response.status === 404 || response.status === 410) throw new TaskError('日曆入面已經搵唔到呢項（可能喺 iPhone 刪咗）。', 404);
     if (!response.ok) throw new TaskError(`Google Calendar returned HTTP ${response.status}. If access expired, reconnect Google on the setup page.`, 502);
   }
   await db(env).prepare('UPDATE tasks SET title = ?, reminders = ? WHERE id = ?').bind(name, JSON.stringify(reminders), id).run();

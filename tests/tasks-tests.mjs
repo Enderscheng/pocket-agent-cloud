@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { parseItems, eventBody, describeDue, localNow, dailyDigest, agendaMarkdown, parseReminders, formatReminders, describeReminders } from '../tasks.js';
+import { parseItems, eventBody, describeDue, localNow, dailyDigest, agendaMarkdown, syncDeleted, parseReminders, formatReminders, describeReminders } from '../tasks.js';
 import { pairSiri, wantsAgenda } from '../siri.js';
 import { pairMail, appsScript } from '../mail.js';
 import { encrypt } from '../google.js';
@@ -32,11 +32,13 @@ class TaskDB {
         const row = { id: db.tasks.length + 1, source: v[0], title: v[1], due_date: v[2], due_time: v[3], notes: v[4], event_id: v[5], status: 'active', created_at: v[6], category: v[7], calendar_id: v[8], reminders: v[9] };
         db.tasks.push(row); return { id: row.id };
       }
+      if (sql.startsWith('SELECT id, event_id, calendar_id FROM tasks'))
+        return db.tasks.filter(t => t.status === 'active' && t.event_id && t.due_date >= v[0] && t.due_date <= v[1]).slice(0, v[2]);
       if (sql.startsWith('SELECT id, source, title, due_date, due_time, notes, event_id, category, reminders FROM tasks'))
         return db.tasks.filter(t => t.status === 'active' && t.due_date >= v[0] && t.due_date <= v[1])
           .sort((a, b) => (a.due_date + (a.due_time || '~')).localeCompare(b.due_date + (b.due_time || '~')));
       if (sql.startsWith('SELECT * FROM tasks WHERE id')) return db.tasks.find(t => t.id === v[0]) || null;
-      if (sql.startsWith("UPDATE tasks SET status = 'cancelled'")) { db.tasks.find(t => t.id === v[0]).status = 'cancelled'; return {}; }
+      if (sql.startsWith("UPDATE tasks SET status = 'cancelled'")) { const row = db.tasks.find(t => t.id === v[0]); if (row.status === 'active') row.status = 'cancelled'; return {}; }
       if (sql.startsWith('INSERT INTO mail_seen')) { if (db.seen.has(v[0])) return null; db.seen.set(v[0], v[1]); return { source_id: v[0] }; }
       if (sql.startsWith('DELETE FROM mail_seen WHERE source_id')) { db.seen.delete(v[0]); return {}; }
       if (sql.startsWith('DELETE FROM mail_seen WHERE seen_at')) return {};
@@ -80,6 +82,7 @@ export async function runTaskTests(worker) {
   } };
   const calls = [];
   let eventCounter = 0, rejectButtons = false, createCalendarStatus = 200;
+  const deletedEvents = new Map();
   globalThis.fetch = async (url, options = {}) => {
     calls.push({ url, options });
     if (url === 'https://oauth2.googleapis.com/token') {
@@ -95,6 +98,11 @@ export async function runTaskTests(worker) {
       if (calendarStatus !== 200) return new Response('{"error":"secret detail"}', { status: calendarStatus });
       if (options.method === 'DELETE') return new Response(null, { status: 204 });
       if (options.method === 'PATCH') return Response.json({});
+      if (!options.method || options.method === 'GET') {
+        const id = decodeURIComponent(url.split('/events/')[1] || '');
+        if (deletedEvents.has(id)) return deletedEvents.get(id) === 'cancelled' ? Response.json({ id, status: 'cancelled' }) : new Response('{}', { status: 404 });
+        return Response.json({ id, status: 'confirmed' });
+      }
       return Response.json({ id: 'event-' + ++eventCounter });
     }
     if (url.includes('generativelanguage.googleapis.com')) return Response.json({ candidates: [{ content: { parts: [{ text: aiReply }] } }] });
@@ -266,8 +274,9 @@ export async function runTaskTests(worker) {
     const lab = db.tasks.at(-1);
 
     d = await interact({ type: 3, data: { custom_id: 'cal:upcoming', component_type: 2 }, message: { embeds: settingsEmbeds } });
-    const upcomingEmbeds = d.data.embeds;
-    check(d.type === 7 && upcomingEmbeds[0].description.includes('交 Lab') && d.data.components[0].components[0].options.some(o => o.value === String(lab.id)), 'Upcoming list shows items to pick');
+    const upcoming = JSON.parse(lastEditBody());
+    const upcomingEmbeds = upcoming.embeds;
+    check(d.type === 6 && upcomingEmbeds[0].description.includes('交 Lab') && upcoming.components[0].components[0].options.some(o => o.value === String(lab.id)), 'Upcoming list shows items to pick');
     d = await interact({ type: 3, data: { custom_id: 'cal:item', component_type: 3, values: [String(lab.id)] }, message: { embeds: upcomingEmbeds } });
     check(d.type === 9 && d.data.components[1].components[0].value === '3日, 1個鐘', 'Picking an item opens a form with its reminders');
     calls.length = 0;
@@ -276,6 +285,28 @@ export async function runTaskTests(worker) {
     const patched = JSON.parse(patch.options.body);
     check(d.type === 6 && patch.url.includes(encodeURIComponent('cal-功課@group.calendar.google.com')) && patched.summary === '📚 交 Lab 報告' && patched.reminders.overrides.map(o => o.minutes).join() === '1440,30', 'Editing an item updates Google Calendar');
     check(db.tasks.at(-1).title === '交 Lab 報告' && JSON.parse(lastEditBody()).content.includes('✅'), 'Edit saved and the list refreshed');
+
+    // ---- Items deleted by hand in the calendar ----
+    const savedLink = db.link;
+    deletedEvents.set(lab.event_id, 'gone');
+    calls.length = 0;
+    d = await formReply(`cal:edit:${lab.id}`, { title: 'x', reminders: '' }, upcomingEmbeds);
+    check(db.tasks.find(t => t.id === lab.id).status === 'cancelled' && !calls.some(c => c.options.method === 'PATCH' && c.url.includes('googleapis')) && JSON.parse(lastEditBody()).content.includes('刪咗'), 'Editing an item deleted in the calendar removes it instead of bringing it back');
+    aiReply = JSON.stringify({ items: [{ title: '睇牙醫', due_date: plusDays(today, 2), due_time: '10:00', notes: '', category: 'personal' }] });
+    db.limits.clear();
+    await post('/api/siri', { note: '後日十點睇牙醫' }, siriKey);
+    const dentist = db.tasks.at(-1);
+    deletedEvents.set(dentist.event_id, 'cancelled');
+    d = await interact({ type: 3, data: { custom_id: 'cal:upcoming', component_type: 2 }, message: { embeds: [{ title: 'Pocket Agent control panel' }] } });
+    const cleaned = JSON.parse(lastEditBody());
+    check(d.type === 5 && d.data.flags === 64 && dentist.status === 'cancelled' && cleaned.content.includes('🧹 有 1 項') && !cleaned.embeds[0].description.includes('睇牙醫'), 'Opening the upcoming list removes items deleted in the calendar');
+    const keep = db.tasks.filter(t => t.status === 'active' && t.event_id).map(t => t.id);
+    calendarStatus = 500;
+    check(await syncDeleted(env, 30) === 0 && db.tasks.filter(t => t.status === 'active' && t.event_id).map(t => t.id).join() === keep.join(), 'Google errors never cancel anything');
+    calendarStatus = 200;
+    db.link = { ...db.link, refresh_cipher: 'broken' };
+    check(await syncDeleted(env, 30) === 0, 'No Google access: nothing cancelled');
+    db.link = savedLink;
     d = await interact({ type: 3, data: { custom_id: 'cal:reset', component_type: 2 }, message: { embeds: settingsEmbeds } });
     check(!db.settings.has('cat:study') && d.type === 7, 'Reset brings back the default settings');
     d = await interact({ type: 3, data: { custom_id: 'cal:settings', component_type: 2 }, message: { embeds: [{ title: 'Pocket Agent control panel' }] } });

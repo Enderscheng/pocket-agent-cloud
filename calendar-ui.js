@@ -4,7 +4,7 @@
 // Owner checks and signature checks happen in discord.js before anything here runs.
 import {
   CATEGORIES, calendarName, categorySettings, saveCategorySettings, resetCategorySettings, cleanIcon, upcomingTasks,
-  getTask, editTask, taskReminders, parseReminders, formatReminders, describeReminders, describeDue, TaskError,
+  getTask, editTask, syncQuietly, taskReminders, parseReminders, formatReminders, describeReminders, describeDue, TaskError,
 } from './tasks.js';
 import { editOriginal } from './discord.js';
 
@@ -87,7 +87,16 @@ export async function calendarInteraction(env, ctx, interaction) {
   const show = async (build, note) => reply(ours(interaction) ? UPDATE : NEW_MESSAGE, await build(env, note));
   try {
     if (id === 'cal:settings') return show(settingsMessage);
-    if (id === 'cal:upcoming') return show(upcomingMessage);
+    if (id === 'cal:upcoming') {
+      // Checking Google for items deleted by hand takes a moment: acknowledge, then show the list.
+      const inPlace = ours(interaction);
+      ctx.waitUntil((async () => {
+        const removed = await syncQuietly(env, UPCOMING_DAYS);
+        const note = removed ? `🧹 有 ${removed} 項已經喺日曆刪咗，已經由列表移走。` : '';
+        await editOriginal(env, interaction.token, await upcomingMessage(env, note).catch(error => ({ content: problem(error) })));
+      })());
+      return inPlace ? reply(DEFERRED_UPDATE) : reply(5, { flags: 64 });
+    }
     if (id === 'cal:reset') { await resetCategorySettings(env); return show(settingsMessage, '✅ 全部分類已經還原預設。'); }
     if (id === 'cal:pick') {
       const key = String(interaction.data.values?.[0] || '');

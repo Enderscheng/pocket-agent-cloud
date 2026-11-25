@@ -5,7 +5,7 @@
 // No calendar, Google account, notes or voice-key access is reachable from here.
 import { answerText } from './voice.js';
 import { calendarInteraction, settingsMessage } from './calendar-ui.js';
-import { cancelTask, agendaMarkdown, ensureTaskTables, describeDue, isChinese, TaskError } from './tasks.js';
+import { cancelTask, syncQuietly, agendaMarkdown, ensureTaskTables, describeDue, isChinese, TaskError } from './tasks.js';
 const API = 'https://discord.com/api/v10';
 const DEFAULT_GEMINI_MODEL = 'gemini-flash-latest';
 const DEFAULT_FALLBACK_MODEL = 'gemini-flash-lite-latest';
@@ -542,6 +542,7 @@ const HELP_PAGES = {
     '**頻道入面嘅訊息**',
     '🎙️ Siri 問答　📌 記低　📬 郵件 deadline　☀️ 每朝摘要',
     'deadline 卡下面有 **取消（Cancel）** 掣：撳咗會刪走日曆活動，張卡會劃走。',
+    '喺 iPhone／Google 日曆直接刪咗嘅活動，系統會喺每朝摘要、/todo、「我有咩要做」同「改即將活動」之前自動發現，唔會再列出（Discord 張卡唔會劃走）。',
     '-# 只有你（擁有者）可以用呢啲指令。改咗指令之後要去 /admin → Register Discord commands。',
   ] },
   iphone: { label: 'iPhone Siri', emoji: '📱', title: 'iPhone 捷徑（Shortcuts）', text: [
@@ -660,7 +661,7 @@ export async function discordInteraction(request, env, ctx) {
     }
     if (!['ask', 'model', 'usage', 'panel', 'todo', 'help', 'calendar'].includes(name)) return ephemeral('Unknown command. Re-register commands from the setup page.');
     if (name === 'todo') {
-      ctx.waitUntil(privateFollowUp(env, interaction, async () => `**未來 14 日要做嘅嘢**\n${await agendaMarkdown(env, 14)}\n-# 要取消，撳返嗰項通知下面嘅「取消」掣。要改名或者改提醒：/calendar → 改即將活動。`));
+      ctx.waitUntil(privateFollowUp(env, interaction, async () => `**未來 14 日要做嘅嘢**\n${(await syncQuietly(env, 14), await agendaMarkdown(env, 14))}\n-# 要取消，撳返嗰項通知下面嘅「取消」掣。要改名或者改提醒：/calendar → 改即將活動。`));
       return DEFER_PRIVATE();
     }
     if (name === 'panel') { ctx.waitUntil(panelUpdate(env, interaction.token, () => panelMessage(env))); return DEFER_PRIVATE(); }
