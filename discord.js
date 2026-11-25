@@ -330,18 +330,42 @@ export async function postToChannel(env, channelId, text, extra = {}) {
   if (!/^\d{15,22}$/.test(channelId || '') || !(env.DISCORD_BOT_TOKEN || '').trim()) return false;
   let ok = true;
   const chunks = splitMessage(text);
+  const send = body => fetch(`${API}/channels/${channelId}/messages`, {
+    method: 'POST', signal: AbortSignal.timeout(8000),
+    headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN.trim()}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ allowed_mentions: { parse: [] }, ...body }),
+  });
   for (const [index, chunk] of chunks.entries()) {
+    // Buttons go on the last part only.
+    const last = index === chunks.length - 1 && Object.keys(extra).length > 0;
     try {
-      const response = await fetch(`${API}/channels/${channelId}/messages`, {
-        method: 'POST', signal: AbortSignal.timeout(8000),
-        headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN.trim()}`, 'Content-Type': 'application/json' },
-        // Buttons go on the last part only.
-        body: JSON.stringify({ content: chunk, allowed_mentions: { parse: [] }, ...(index === chunks.length - 1 ? extra : {}) }),
-      });
+      let response = await send({ content: chunk, ...(last ? extra : {}) });
+      if (!response.ok) {
+        await notePostProblem(env, response);
+        // If Discord refuses the buttons, still deliver the text.
+        if (last && response.status === 400) response = await send({ content: chunk });
+      }
       ok &&= response.ok;
     } catch { ok = false; }
   }
   return ok;
+}
+// Keeps only Discord's error code and short message (never message content or tokens),
+// so /panel can show why a post failed.
+async function notePostProblem(env, response) {
+  let detail = '';
+  try { const info = await response.clone().json(); detail = `${info.code ?? ''} ${String(info.message ?? '')}`.trim().slice(0, 150); } catch { /* not JSON */ }
+  const db = database(env);
+  if (!db) return;
+  try {
+    await db.prepare('INSERT INTO discord_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .bind('post_problem', `${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC: HTTP ${response.status}${detail ? ' ' + detail : ''}`).run();
+  } catch { /* settings table missing */ }
+}
+async function postProblem(env) {
+  const db = database(env);
+  if (!db) return '';
+  try { return (await db.prepare("SELECT value FROM discord_settings WHERE key = 'post_problem'").first())?.value || ''; } catch { return ''; }
 }
 async function resetModels(env) {
   const db = database(env);
@@ -404,7 +428,7 @@ async function editOriginal(env, token, payload) {
   } catch { /* Discord unreachable. Never log content or tokens. */ }
 }
 export async function panelMessage(env, note = '') {
-  const [current, rows, channel] = await Promise.all([currentModels(env), usageRows(env), siriChannel(env)]);
+  const [current, rows, channel, problem] = await Promise.all([currentModels(env), usageRows(env), siriChannel(env), postProblem(env)]);
   let models = [], listProblem = '';
   if ((env.GEMINI_API_KEY || '').trim()) {
     try { models = await listModels(env, 2500); } catch { listProblem = "Couldn't load Google's model list just now; press Refresh."; }
@@ -421,6 +445,7 @@ export async function panelMessage(env, note = '') {
       { name: 'Backup model', value: `\`${current.backup}\`\n-# ${current.backupSource}`, inline: true },
       { name: 'Siri, deadline and daily-summary messages go to', value: channel ? `<#${channel}>` : 'Not set: press **Send Siri & deadline updates here** in the channel you want.', inline: false },
       { name: `Requests today (${today()} UTC)`, value: usageLines(rows).slice(0, 1000), inline: false },
+      ...(problem ? [{ name: 'Last Discord posting problem', value: problem.slice(0, 1000), inline: false }] : []),
     ],
     footer: { text: `${listProblem ? listProblem + ' ' : ''}Google doesn't share remaining quota with apps: use "Quota on Google" to see it.`.slice(0, 2000) },
   };

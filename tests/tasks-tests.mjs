@@ -15,6 +15,8 @@ class TaskDB {
     const run = v => {
       if (sql.startsWith('CREATE TABLE')) return {};
       if (sql.startsWith('SELECT key, value FROM discord_settings')) return [...db.settings].filter(([k]) => k === 'model' || k === 'backup').map(([key, value]) => ({ key, value }));
+      if (sql.startsWith('INSERT INTO discord_settings')) { db.settings.set(v[0], v[1]); return {}; }
+      if (sql.startsWith("SELECT value FROM discord_settings WHERE key = 'post_problem'")) return db.settings.has('post_problem') ? { value: db.settings.get('post_problem') } : null;
       if (sql.startsWith("SELECT value FROM discord_settings WHERE key = 'siri_channel'")) return db.settings.has('siri_channel') ? { value: db.settings.get('siri_channel') } : null;
       if (sql.startsWith('INSERT INTO ai_usage') || sql.startsWith('DELETE FROM ai_usage')) return {};
       if (sql === 'SELECT * FROM integration WHERE id = 1') return db.link && { ...db.link };
@@ -69,7 +71,7 @@ export async function runTaskTests(worker) {
     return { choices: [{ message: { content: aiReply }, finish_reason: 'stop' }] };
   } };
   const calls = [];
-  let eventCounter = 0;
+  let eventCounter = 0, rejectButtons = false;
   globalThis.fetch = async (url, options = {}) => {
     calls.push({ url, options });
     if (url === 'https://oauth2.googleapis.com/token') {
@@ -82,6 +84,8 @@ export async function runTaskTests(worker) {
       return Response.json({ id: 'event-' + ++eventCounter });
     }
     if (url.includes('generativelanguage.googleapis.com')) return Response.json({ candidates: [{ content: { parts: [{ text: aiReply }] } }] });
+    if (rejectButtons && url.includes('/channels/') && JSON.parse(options.body).components)
+      return Response.json({ code: 50035, message: 'Invalid Form Body' }, { status: 400 });
     if (url.startsWith('https://discord.com/api/v10/')) return new Response(null, { status: url.includes('/channels/') ? 200 : 204 });
     throw new Error('Unexpected external request: ' + url);
   };
@@ -136,6 +140,10 @@ export async function runTaskTests(worker) {
     let card = channelPosts().at(-1);
     check(card.content.includes('📌 **已記低**') && card.components[0].components[0].custom_id === 'task:cancel:1', 'Discord card with Cancel button');
     check(aiPrompts.at(-1).includes(today) && !calls.some(c => c.url.includes('generativelanguage')), 'Note parsed by Cloudflare AI with today\'s date');
+    rejectButtons = true; calls.length = 0;
+    r = await post('/api/siri', { note: '聽日要買牛奶' }, siriKey);
+    rejectButtons = false;
+    check(channelPosts().length === 2 && !channelPosts()[1].components && channelPosts()[1].content.includes('📌') && /HTTP 400 50035 Invalid Form Body$/.test(db.settings.get('post_problem')), 'Rejected button card is re-sent as text and the reason saved for /panel');
 
     aiFails = true;
     await post('/api/siri', { note: 'buy milk tomorrow' }, siriKey);
