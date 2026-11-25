@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { parseItems, eventBody, describeDue, localNow, dailyDigest } from '../tasks.js';
+import { parseItems, eventBody, describeDue, localNow, dailyDigest, agendaMarkdown } from '../tasks.js';
 import { pairSiri, wantsAgenda } from '../siri.js';
 import { pairMail, appsScript } from '../mail.js';
 import { encrypt } from '../google.js';
@@ -8,12 +8,17 @@ const hex = bytes => Array.from(new Uint8Array(bytes), b => b.toString(16).padSt
 const plusDays = (date, n) => { const [y, m, d] = date.split('-').map(Number); return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10); };
 
 class TaskDB {
-  constructor() { this.settings = new Map(); this.tasks = []; this.seen = new Map(); this.limits = new Map(); this.keys = {}; this.link = null; }
+  constructor() { this.settings = new Map(); this.tasks = []; this.seen = new Map(); this.limits = new Map(); this.keys = {}; this.link = null; this.calendars = new Map(); }
   withSession() { return this; }
   prepare(sql) {
     const db = this;
     const run = v => {
       if (sql.startsWith('CREATE TABLE')) return {};
+      if (sql.startsWith('ALTER TABLE tasks ADD COLUMN')) { if (db.altered?.has(sql)) throw Error('duplicate column'); (db.altered ||= new Set()).add(sql); return {}; }
+      if (sql.startsWith('SELECT calendar_id FROM agent_calendars')) return db.calendars.has(v[0]) ? { calendar_id: db.calendars.get(v[0]) } : null;
+      if (sql.startsWith('INSERT INTO agent_calendars')) { if (db.calendars.has(v[0])) return null; db.calendars.set(v[0], 'creating'); return { category: v[0] }; }
+      if (sql.startsWith('UPDATE agent_calendars')) { db.calendars.set(v[1], v[0]); return {}; }
+      if (sql.startsWith('DELETE FROM agent_calendars')) { db.calendars.delete(v[0]); return {}; }
       if (sql.startsWith('SELECT key, value FROM discord_settings')) return [...db.settings].filter(([k]) => k === 'model' || k === 'backup').map(([key, value]) => ({ key, value }));
       if (sql.startsWith('INSERT INTO discord_settings')) { db.settings.set(v[0], v[1]); return {}; }
       if (sql.startsWith("SELECT value FROM discord_settings WHERE key = 'post_problem'")) return db.settings.has('post_problem') ? { value: db.settings.get('post_problem') } : null;
@@ -21,10 +26,10 @@ class TaskDB {
       if (sql.startsWith('INSERT INTO ai_usage') || sql.startsWith('DELETE FROM ai_usage')) return {};
       if (sql === 'SELECT * FROM integration WHERE id = 1') return db.link && { ...db.link };
       if (sql.startsWith('INSERT INTO tasks')) {
-        const row = { id: db.tasks.length + 1, source: v[0], title: v[1], due_date: v[2], due_time: v[3], notes: v[4], event_id: v[5], status: 'active', created_at: v[6] };
+        const row = { id: db.tasks.length + 1, source: v[0], title: v[1], due_date: v[2], due_time: v[3], notes: v[4], event_id: v[5], status: 'active', created_at: v[6], category: v[7], calendar_id: v[8] };
         db.tasks.push(row); return { id: row.id };
       }
-      if (sql.startsWith('SELECT id, source, title, due_date, due_time, notes, event_id FROM tasks'))
+      if (sql.startsWith('SELECT id, source, title, due_date, due_time, notes, event_id, category FROM tasks'))
         return db.tasks.filter(t => t.status === 'active' && t.due_date >= v[0] && t.due_date <= v[1])
           .sort((a, b) => (a.due_date + (a.due_time || '~')).localeCompare(b.due_date + (b.due_time || '~')));
       if (sql.startsWith('SELECT * FROM tasks WHERE id')) return db.tasks.find(t => t.id === v[0]) || null;
@@ -63,7 +68,7 @@ export async function runTaskTests(worker) {
     refresh_cipher: await encrypt(env, 'private-refresh') };
   const today = localNow('Europe/Copenhagen').date;
   const friday = plusDays(today, 4);
-  let aiReply = JSON.stringify({ items: [{ title: '交 FYP 報告', due_date: friday, due_time: '15:00', notes: '交去 DTU Learn' }] });
+  let aiReply = JSON.stringify({ items: [{ title: '交 FYP 報告', due_date: friday, due_time: '15:00', notes: '交去 DTU Learn', category: 'study' }] });
   let aiFails = false, calendarStatus = 200, aiPrompts = [];
   env.AI = { async run(model, body) {
     aiPrompts.push(body.messages[0].content + '\n' + body.messages[1].content);
@@ -71,14 +76,19 @@ export async function runTaskTests(worker) {
     return { choices: [{ message: { content: aiReply }, finish_reason: 'stop' }] };
   } };
   const calls = [];
-  let eventCounter = 0, rejectButtons = false;
+  let eventCounter = 0, rejectButtons = false, createCalendarStatus = 200;
   globalThis.fetch = async (url, options = {}) => {
     calls.push({ url, options });
     if (url === 'https://oauth2.googleapis.com/token') {
       assert.equal(options.body.get('refresh_token'), 'private-refresh');
       return Response.json({ access_token: 'private-access' });
     }
-    if (url.startsWith('https://www.googleapis.com/calendar/v3/calendars/agent%40group.calendar.google.com/events')) {
+    if (url === 'https://www.googleapis.com/calendar/v3/calendars' && options.method === 'POST') {
+      if (createCalendarStatus !== 200) return new Response('{}', { status: createCalendarStatus });
+      return Response.json({ id: 'cal-' + JSON.parse(options.body).summary.split(' · ')[1] + '@group.calendar.google.com' });
+    }
+    if (url.startsWith('https://www.googleapis.com/calendar/v3/users/me/calendarList/')) return Response.json({});
+    if (/^https:\/\/www\.googleapis\.com\/calendar\/v3\/calendars\/[^/]+\/events/.test(url)) {
       if (calendarStatus !== 200) return new Response('{"error":"secret detail"}', { status: calendarStatus });
       if (options.method === 'DELETE') return new Response(null, { status: 204 });
       return Response.json({ id: 'event-' + ++eventCounter });
@@ -133,11 +143,17 @@ export async function runTaskTests(worker) {
     calls.length = 0;
     let r = await post('/api/siri', { note: '下星期五下晝三點前要交 FYP 報告' }, siriKey);
     check(r.data.answer.startsWith('已經記低：交 FYP 報告') && r.data.answer.includes('下午3:00') && r.data.answer.includes('提你'), 'Siri note confirmed in Cantonese');
-    const created = calls.find(c => c.options.method === 'POST' && c.url.includes('/calendar/v3/'));
+    const created = calls.find(c => c.options.method === 'POST' && c.url.includes('/events'));
+    const madeCalendar = calls.filter(c => c.url === 'https://www.googleapis.com/calendar/v3/calendars');
+    check(madeCalendar.length === 1 && JSON.parse(madeCalendar[0].options.body).summary === 'Agent · 功課' && db.calendars.get('study') === 'cal-功課@group.calendar.google.com', 'First study item creates the Agent · 功課 calendar');
+    check(JSON.parse(calls.find(c => c.url.includes('/calendarList/')).options.body).backgroundColor === '#4285f4', 'New category calendar gets its colour');
+    check(created.url.includes(encodeURIComponent('cal-功課@group.calendar.google.com')) && db.tasks[0].category === 'study' && db.tasks[0].calendar_id === 'cal-功課@group.calendar.google.com', 'Study item goes into the study calendar and remembers it');
+    check(r.data.answer.includes('放咗喺功課'), 'Siri says which category it chose');
     const event = JSON.parse(created.options.body);
     check(event.summary === '⏰ 交 FYP 報告' && event.start.dateTime === `${friday}T15:00:00` && event.start.timeZone === 'Europe/Copenhagen' && created.options.headers.Authorization === 'Bearer private-access', 'Event written to the Agent calendar');
     check(db.tasks[0].event_id === 'event-1' && db.tasks[0].source === 'siri', 'Task saved with its event');
     let card = channelPosts().at(-1);
+    check(card.content.includes('📚 Agent · 功課'), 'Discord card names the category calendar');
     check(card.content.includes('📌 **已記低**') && card.components[0].components[0].custom_id === 'task:cancel:1', 'Discord card with Cancel button');
     check(aiPrompts.at(-1).includes(today) && !calls.some(c => c.url.includes('generativelanguage')), 'Note parsed by Cloudflare AI with today\'s date');
     rejectButtons = true; calls.length = 0;
@@ -193,12 +209,34 @@ export async function runTaskTests(worker) {
     const script = appsScript(base, mailKey);
     check(script.includes(`'${base}/api/mail'`) && script.includes(mailKey) && script.includes('everyMinutes(15)'), 'Apps Script filled in with address and key');
 
+    // ---- Categories ----
+    calls.length = 0;
+    const calendarsBefore = db.calendars.size;
+    aiReply = JSON.stringify({ items: [{ title: '溫 COMP2011', due_date: friday, due_time: null, notes: '', category: 'study' }] });
+    await post('/api/siri', { note: '星期五溫 COMP2011' }, siriKey);
+    check(db.calendars.size === calendarsBefore && !calls.some(c => c.url === 'https://www.googleapis.com/calendar/v3/calendars'), 'Second study item reuses the same calendar');
+    aiReply = JSON.stringify({ items: [{ title: '媽媽生日', due_date: plusDays(today, 20), due_time: null, notes: '', category: 'birthday' }] });
+    calls.length = 0;
+    await post('/api/siri', { note: '媽媽生日係下個月' }, siriKey);
+    const bday = JSON.parse(calls.find(c => c.options.method === 'POST' && c.url.includes('/events')).options.body);
+    check(bday.summary === '🎂 媽媽生日' && bday.recurrence[0] === 'RRULE:FREQ=YEARLY' && channelPosts().at(-1).content.includes('每年'), 'Birthdays go to the birthday calendar and repeat every year');
+    createCalendarStatus = 403;
+    aiReply = JSON.stringify({ items: [{ title: '面試', due_date: friday, due_time: '10:00', notes: '', category: 'work' }] });
+    calls.length = 0;
+    await post('/api/siri', { note: '星期五十點面試' }, siriKey);
+    check(calls.some(c => c.url.startsWith('https://www.googleapis.com/calendar/v3/calendars/agent%40group.calendar.google.com/events')) && !db.calendars.has('work') && db.tasks.at(-1).event_id, 'If a category calendar cannot be made, the item still goes to the Agent calendar and it is retried next time');
+    createCalendarStatus = 200;
+    check(parseItems('{"items":[{"title":"x","due_date":"' + friday + '","category":"evil"}]}', today)[0].category === 'personal', 'Unknown category becomes personal');
+    check((await agendaMarkdown(env, 30)).includes('🎂 **媽媽生日**'), '/todo shows each item\'s category');
+    for (const t of db.tasks.slice(-3)) t.status = 'cancelled';
+    db.limits.clear();
+
     // ---- Discord: cancel button, /todo, morning summary ----
     calls.length = 0;
     let d = await interact({ type: 3, data: { custom_id: 'task:cancel:1', component_type: 2 }, message: { content: 'card' } });
     const removed = calls.find(c => c.options.method === 'DELETE');
     const edited = JSON.parse(calls.find(c => c.url.endsWith('/messages/@original')).options.body);
-    check(d.type === 6 && removed.url.endsWith('/events/event-1') && db.tasks[0].status === 'cancelled', 'Cancel removes the calendar event');
+    check(d.type === 6 && removed.url.includes(encodeURIComponent('cal-功課@group.calendar.google.com')) && removed.url.endsWith('/events/event-1') && db.tasks[0].status === 'cancelled', 'Cancel removes the calendar event');
     check(edited.content.includes('~~交 FYP 報告') && edited.components.length === 0, 'Cancelled card is struck through and loses its button');
     calls.length = 0;
     d = await interact({ type: 2, data: { name: 'todo' } });
