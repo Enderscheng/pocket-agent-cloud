@@ -49,9 +49,10 @@ Do this after the version with Discord support has deployed.
 | `/model set name: … backup: True/False` | Change the main model (or the backup). Suggestions appear as you type. A model set here overrides the Cloudflare variables. |
 | `/model reset` | Remove the Discord choice and go back to the Cloudflare variables or the defaults. |
 | `/usage` | Requests Pocket Agent sent today (UTC) per model, including free-limit hits. |
-| `/panel` | Control panel with menus to choose the main and backup models, today's usage, the Siri channel button and a link to Google's quota page. Changes apply immediately. |
+| `/panel` | Control panel with menus to choose the main and backup models, today's usage, the Siri channel button and a link to Google's quota page, and a ❓ Help button. Changes apply immediately. |
+| `/help` | 使用說明 (in Cantonese): every command, the /panel buttons, the iPhone shortcuts, Gmail and calendar, and what to do when something breaks. Buttons switch between the pages. |
 
-Only you see the replies to `/model`, `/usage` and `/panel`. For Siri, see [SIRI-SETUP.md](SIRI-SETUP.md).
+Only you see the replies to `/model`, `/usage`, `/panel` and `/help`. For Siri, see [SIRI-SETUP.md](SIRI-SETUP.md).
 
 Google doesn't tell apps how much free quota is left, so `/usage` shows Pocket Agent's own count. Your official limits and remaining usage are at https://aistudio.google.com/usage.
 

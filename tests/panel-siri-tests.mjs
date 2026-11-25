@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { pairSiri, speakable } from '../siri.js';
+import { helpMessage } from '../discord.js';
 
 const hex = bytes => Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
 
@@ -119,6 +120,22 @@ export async function runPanelSiriTests(worker) {
 
     await interact({ type: 3, data: { custom_id: 'panel:reset', component_type: 2 } });
     check(!db.settings.has('model') && db.settings.get('siri_channel') === channel, 'Reset clears models but keeps the Siri channel');
+
+    // ---- /help ----
+    check(buttons.some(b => b.custom_id === 'help:home') && buttons.length <= 5, 'Panel has a Help button and stays within 5 buttons a row');
+    r = await interact({ type: 2, data: { name: 'help' } });
+    const pages = r.data.components[0].components;
+    check(r.type === 4 && r.data.flags === 64 && r.data.embeds[0].title.includes('使用說明'), '/help replies privately with the overview');
+    check(pages.length === 5 && pages.every(b => /^help:\w+$/.test(b.custom_id)) && pages[0].disabled, '/help has one button per page, the current one disabled');
+    r = await interact({ type: 3, data: { custom_id: 'help:discord', component_type: 2 }, message: { embeds: r.data.embeds } });
+    check(r.type === 7 && ['/ask', '/todo', '/panel', '/usage', '/model', 'Cancel'].every(w => r.data.embeds[0].description.includes(w)), 'Help page buttons switch the page in place and list every command');
+    r = await interact({ type: 3, data: { custom_id: 'help:iphone', component_type: 2 }, message: { embeds: panel.embeds } });
+    check(r.type === 4 && r.data.flags === 64 && r.data.embeds[0].description.includes('ps1_'), 'Help from the panel opens a new private message');
+    r = await interact({ type: 3, data: { custom_id: 'help:nope', component_type: 2 } });
+    check(r.data.embeds[0].title.includes('使用說明'), 'Unknown help page falls back to the overview');
+    check(['home', 'discord', 'iphone', 'mail', 'fix'].every(p => helpMessage(p).embeds[0].description.length < 4000), 'Every help page fits in a Discord embed');
+    r = await interact({ type: 2, data: { name: 'help' } }, '999999999999999999');
+    check(!r.data.embeds, 'Strangers do not get /help');
 
     // ---- Siri ----
     check((await siri({ question: 'hi' })).data.answer.includes('Siri key'), 'Siri without key is told to add one');

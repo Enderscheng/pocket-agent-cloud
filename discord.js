@@ -1,6 +1,7 @@
 // Discord slash commands for the owner only: /ask sends one question to Gemini,
 // /model picks the Gemini model, /usage shows today's request counts and /panel is a
-// button-and-menu control panel for the same settings plus the Siri channel.
+// button-and-menu control panel for the same settings plus the Siri channel, and /help
+// is a private guide to the whole system.
 // No calendar, Google account, notes or voice-key access is reachable from here.
 import { answerText } from './voice.js';
 import { cancelTask, agendaMarkdown, ensureTaskTables, describeDue, isChinese, TaskError } from './tasks.js';
@@ -36,6 +37,8 @@ export const COMMANDS = [{
   name: 'panel', type: 1, description: 'Open the Pocket Agent control panel (models, usage, Siri)',
 }, {
   name: 'todo', type: 1, description: 'Show deadlines and to-dos for the next 14 days',
+}, {
+  name: 'help', type: 1, description: 'How Pocket Agent works: every command, button and iPhone shortcut',
 }];
 const LIMITS_URL = 'https://aistudio.google.com/usage';
 
@@ -459,6 +462,7 @@ export async function panelMessage(env, note = '') {
     { type: 2, style: 1, custom_id: 'panel:siri', label: 'Send Siri & deadline updates here', emoji: { name: '🎙️' } },
     { type: 2, style: 4, custom_id: 'panel:reset', label: 'Reset models' },
     { type: 2, style: 5, url: LIMITS_URL, label: 'Quota on Google' },
+    { type: 2, style: 2, custom_id: 'help:home', label: 'Help', emoji: { name: '❓' } },
   ] });
   return { content: note, embeds: [embed], components };
 }
@@ -495,6 +499,108 @@ async function panelUpdate(env, token, work) {
   await editOriginal(env, token, payload);
 }
 
+// ---- /help: a private guide with one page per topic; buttons switch pages in place ----
+const HELP_PAGES = {
+  home: { label: '總覽', emoji: '📖', title: 'Pocket Agent 使用說明', text: [
+    'Pocket Agent 將 **Discord**、**iPhone Siri**、**Gmail／學校 Outlook** 同 **日曆** 連埋一齊。',
+    '',
+    '**成個系統點運作**',
+    '🎙️ 你問 Siri「問助手」→ Gemini 答你（讀出嚟）→ 同一份問答貼落 Discord',
+    '📌 你講「記低」→ AI 搵出日期 → 加入 **Agent** 日曆（iPhone 日曆 App 都見到）→ Discord 出一張卡',
+    '📬 Gmail 每 15 分鐘檢查新郵件 → 搵到 deadline → 同樣加入日曆 + Discord 卡',
+    '☀️ 每朝自動貼未來 7 日要做嘅嘢',
+    '',
+    '**撳下面嘅掣睇每部分詳細說明** 👇',
+    '-# 只有你睇到呢個訊息。隨時打 /help 再開。',
+  ] },
+  discord: { label: 'Discord 指令', emoji: '💬', title: 'Discord 指令同控制台', text: [
+    '**斜線指令（Slash commands）**：喺訊息欄打 `/` 揀',
+    '`/help` — 呢份說明',
+    '`/ask question: …` — 問 Gemini。加 `web: True` 會先上 Google 搵資料，答案會列出來源',
+    '`/todo` — 未來 14 日嘅 deadline 同要做嘅嘢',
+    '`/panel` — 控制台（見下面）',
+    '`/usage` — 今日用咗幾多次 AI',
+    '`/model show` / `list` / `set name:…` / `reset` — 睇／揀／重設 Gemini 模型',
+    '',
+    '**/panel 控制台**',
+    '• 兩個選單（menu）：揀主模型（Main model）同後備模型（Backup model）',
+    '• 🔄 **Refresh** — 更新資料',
+    '• 🎙️ **Send Siri & deadline updates here** — 喺你想收通知嘅頻道撳，之後 Siri 問答、deadline 卡同每朝摘要都貼去嗰度',
+    '• **Reset models** — 返回預設模型',
+    '• **Quota on Google** — 去 Google 睇免費額度仲剩幾多',
+    '• ❓ **Help** — 開呢份說明',
+    '',
+    '**頻道入面嘅訊息**',
+    '🎙️ Siri 問答　📌 記低　📬 郵件 deadline　☀️ 每朝摘要',
+    'deadline 卡下面有 **取消（Cancel）** 掣：撳咗會刪走日曆活動，張卡會劃走。',
+    '-# 只有你（擁有者）可以用呢啲指令。改咗指令之後要去 /admin → Register Discord commands。',
+  ] },
+  iphone: { label: 'iPhone Siri', emoji: '📱', title: 'iPhone 捷徑（Shortcuts）', text: [
+    '對住 iPhone 講「嘿 Siri，<捷徑名>」。',
+    '',
+    '**問助手** — 問任何問題',
+    '→ Siri 讀出答案，Discord 頻道會貼埋問答（有格式同連結）',
+    '',
+    '**記低** — 例：「記低星期五交 COMP2011 功課」',
+    '→ 加入 **Agent** 日曆，Discord 出一張 📌 卡',
+    '',
+    '**我有咩要做** — 讀出未來 7 日要做嘅嘢',
+    '',
+    '**每個捷徑嘅設定**（捷徑 App → 取得 URL 內容（Get Contents of URL））',
+    '• 方法（Method）：**POST**',
+    '• 標頭（Headers）：`Authorization` = `Bearer ps1_…`（你嘅 Siri key）',
+    '• 要求本文（Request Body）：**JSON**',
+    '　問助手：`question` = 聽寫文字（Dictate Text）',
+    '　記低：`note` = 聽寫文字',
+    '　我有咩要做：`agenda` = 布林值（Boolean）**true**',
+    '• 之後：取得辭典值（Get Dictionary Value）`answer` → 朗讀（Speak）',
+    '揀變數：撳欄位 → **選取變數（Select Variable）** → 撳上面嘅「聽寫文字」動作。',
+    '',
+    '**限制**：每分鐘 6 次，每日 150 次。',
+    '-# 詳細步驟：GitHub 入面嘅 SIRI-SETUP.md 同 MAIL-SETUP.md。',
+  ] },
+  mail: { label: '電郵同日曆', emoji: '📬', title: '電郵、日曆同每朝摘要', text: [
+    '**Gmail**：Google Apps Script 每 15 分鐘檢查收件匣（Inbox）最近 2 日嘅新郵件（唔睇推廣 Promotions 同社交 Social）。',
+    '**學校 Outlook**：自動轉寄去 Gmail，Gmail 篩選器加「學校」標籤。⚠️ 唔好揀「略過收件匣（Skip the Inbox）」，否則程式睇唔到。',
+    '',
+    '搵到 deadline → 加入 Google 日曆 **Agent** → iPhone 日曆 App 都見到 → Discord 出 📬 卡。',
+    '',
+    '**每朝摘要** ☀️：每日 06:00 UTC 自動貼未來 7 日要做嘅嘢。',
+    '',
+    '**私隱**：郵件內容只交俾 Cloudflare Workers AI 分析，唔會俾 Gemini，亦唔會記錄。',
+    '',
+    '⚠️ Gmail 儲存空間滿咗就收唔到新郵件，deadline 都會偵測唔到。',
+    '-# 詳細步驟：GitHub 入面嘅 MAIL-SETUP.md。',
+  ] },
+  fix: { label: '出事點算', emoji: '🛠️', title: '出事點算', text: [
+    '**Siri 答咗但 Discord 冇出**',
+    '→ 開 /panel 睇「Siri, deadline and daily-summary messages go to」有冇設定頻道；冇就喺頻道撳 🎙️ **Send Siri & deadline updates here**',
+    '→ 睇 /panel 有冇「**Last Discord posting problem**」，有就將嗰行影低',
+    '→ Bot 要喺頻道有 **View Channel** 同 **Send Messages** 權限',
+    '',
+    '**Gemini 好慢／答唔到**',
+    '→ 免費額度可能用晒：撳 /panel → **Quota on Google** 睇',
+    '→ 系統會自動試後備模型，再唔得就用 Cloudflare AI',
+    '',
+    '**Siri 話「limit reached」** → 每分鐘 6 次／每日 150 次，等一陣再試',
+    '',
+    '**指令唔見咗／Unknown command** → /admin → **Register Discord commands**',
+    '',
+    '**日曆冇加到** → 去 /admin 撳 **Reconnect Google**（重新連接 Google）',
+  ] },
+};
+export function helpMessage(page = 'home') {
+  const current = HELP_PAGES[page] ? page : 'home';
+  const { title, text } = HELP_PAGES[current];
+  return {
+    flags: 64, allowed_mentions: { parse: [] },
+    embeds: [{ title, description: text.join('\n').slice(0, 4000), color: 0x174ab9 }],
+    components: [{ type: 1, components: Object.entries(HELP_PAGES).map(([id, p]) => ({
+      type: 2, style: id === current ? 1 : 2, custom_id: `help:${id}`, label: p.label, emoji: { name: p.emoji }, disabled: id === current,
+    })) }],
+  };
+}
+
 export async function discordInteraction(request, env, ctx) {
   try {
     if (request.method !== 'POST') return json({ error: 'Use POST.' }, 405);
@@ -520,18 +626,25 @@ export async function discordInteraction(request, env, ctx) {
       ctx.waitUntil(cancelFromButton(env, interaction));
       return json({ type: 6 });
     }
+    const helpPage = /^help:(\w{1,20})$/.exec(interaction.data?.custom_id || '')?.[1];
+    if (interaction.type === 3 && helpPage) {
+      // From /help, switch the page in place; from /panel, open the guide as a new private message.
+      const inHelp = (interaction.message?.embeds || []).some(e => Object.values(HELP_PAGES).some(p => p.title === e.title));
+      return json({ type: inHelp ? 7 : 4, data: helpMessage(helpPage) });
+    }
     if (interaction.type === 3) {
       if (!/^panel:(main|backup|refresh|reset|siri)$/.test(interaction.data?.custom_id || '')) return ephemeral('This button is out of date. Open /panel again.');
       // Acknowledge now; the panel message is edited in place once the change is saved.
       ctx.waitUntil(panelUpdate(env, interaction.token, () => panelAction(env, interaction)));
       return json({ type: 6 });
     }
-    if (!['ask', 'model', 'usage', 'panel', 'todo'].includes(name)) return ephemeral('Unknown command. Re-register commands from the setup page.');
+    if (!['ask', 'model', 'usage', 'panel', 'todo', 'help'].includes(name)) return ephemeral('Unknown command. Re-register commands from the setup page.');
     if (name === 'todo') {
       ctx.waitUntil(privateFollowUp(env, interaction, async () => `**未來 14 日要做嘅嘢**\n${await agendaMarkdown(env, 14)}\n-# 要取消，撳返嗰項通知下面嘅「取消」掣。`));
       return DEFER_PRIVATE();
     }
     if (name === 'panel') { ctx.waitUntil(panelUpdate(env, interaction.token, () => panelMessage(env))); return DEFER_PRIVATE(); }
+    if (name === 'help') return json({ type: 4, data: helpMessage() });
     if (name === 'usage') return ephemeral(await usageReport(env));
     if (name === 'model') {
       const sub = interaction.data.options?.[0];
