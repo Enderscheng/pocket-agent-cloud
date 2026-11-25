@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { parseItems, eventBody, describeDue, localNow, dailyDigest, agendaMarkdown } from '../tasks.js';
+import { parseItems, eventBody, describeDue, localNow, dailyDigest, agendaMarkdown, parseReminders, formatReminders, describeReminders } from '../tasks.js';
 import { pairSiri, wantsAgenda } from '../siri.js';
 import { pairMail, appsScript } from '../mail.js';
 import { encrypt } from '../google.js';
@@ -21,15 +21,18 @@ class TaskDB {
       if (sql.startsWith('DELETE FROM agent_calendars')) { db.calendars.delete(v[0]); return {}; }
       if (sql.startsWith('SELECT key, value FROM discord_settings')) return [...db.settings].filter(([k]) => k === 'model' || k === 'backup').map(([key, value]) => ({ key, value }));
       if (sql.startsWith('INSERT INTO discord_settings')) { db.settings.set(v[0], v[1]); return {}; }
+      if (sql === 'SELECT value FROM discord_settings WHERE key = ?') return db.settings.has(v[0]) ? { value: db.settings.get(v[0]) } : null;
+      if (sql === 'DELETE FROM discord_settings WHERE key = ?') { db.settings.delete(v[0]); return {}; }
+      if (sql.startsWith('UPDATE tasks SET title = ?, reminders = ?')) { Object.assign(db.tasks.find(t => t.id === v[2]), { title: v[0], reminders: v[1] }); return {}; }
       if (sql.startsWith("SELECT value FROM discord_settings WHERE key = 'post_problem'")) return db.settings.has('post_problem') ? { value: db.settings.get('post_problem') } : null;
       if (sql.startsWith("SELECT value FROM discord_settings WHERE key = 'siri_channel'")) return db.settings.has('siri_channel') ? { value: db.settings.get('siri_channel') } : null;
       if (sql.startsWith('INSERT INTO ai_usage') || sql.startsWith('DELETE FROM ai_usage')) return {};
       if (sql === 'SELECT * FROM integration WHERE id = 1') return db.link && { ...db.link };
       if (sql.startsWith('INSERT INTO tasks')) {
-        const row = { id: db.tasks.length + 1, source: v[0], title: v[1], due_date: v[2], due_time: v[3], notes: v[4], event_id: v[5], status: 'active', created_at: v[6], category: v[7], calendar_id: v[8] };
+        const row = { id: db.tasks.length + 1, source: v[0], title: v[1], due_date: v[2], due_time: v[3], notes: v[4], event_id: v[5], status: 'active', created_at: v[6], category: v[7], calendar_id: v[8], reminders: v[9] };
         db.tasks.push(row); return { id: row.id };
       }
-      if (sql.startsWith('SELECT id, source, title, due_date, due_time, notes, event_id, category FROM tasks'))
+      if (sql.startsWith('SELECT id, source, title, due_date, due_time, notes, event_id, category, reminders FROM tasks'))
         return db.tasks.filter(t => t.status === 'active' && t.due_date >= v[0] && t.due_date <= v[1])
           .sort((a, b) => (a.due_date + (a.due_time || '~')).localeCompare(b.due_date + (b.due_time || '~')));
       if (sql.startsWith('SELECT * FROM tasks WHERE id')) return db.tasks.find(t => t.id === v[0]) || null;
@@ -91,6 +94,7 @@ export async function runTaskTests(worker) {
     if (/^https:\/\/www\.googleapis\.com\/calendar\/v3\/calendars\/[^/]+\/events/.test(url)) {
       if (calendarStatus !== 200) return new Response('{"error":"secret detail"}', { status: calendarStatus });
       if (options.method === 'DELETE') return new Response(null, { status: 204 });
+      if (options.method === 'PATCH') return Response.json({});
       return Response.json({ id: 'event-' + ++eventCounter });
     }
     if (url.includes('generativelanguage.googleapis.com')) return Response.json({ candidates: [{ content: { parts: [{ text: aiReply }] } }] });
@@ -121,6 +125,7 @@ export async function runTaskTests(worker) {
     await Promise.all(waits);
     return response.json();
   };
+  const lastEditBody = () => calls.filter(c => c.url.endsWith('/messages/@original')).at(-1).options.body;
   const channelPosts = () => calls.filter(c => c.url === `https://discord.com/api/v10/channels/${channel}/messages`).map(c => JSON.parse(c.options.body));
   try {
     // ---- Pure helpers ----
@@ -231,9 +236,55 @@ export async function runTaskTests(worker) {
     for (const t of db.tasks.slice(-3)) t.status = 'cancelled';
     db.limits.clear();
 
+    // ---- Reminder wording ----
+    check(parseReminders('1日, 2個鐘', false).join() === '1440,120' && parseReminders('1.5個鐘、30分鐘', false).join() === '90,30' && parseReminders('2h 30m', false).join() === '150', 'Timed reminders understood in Cantonese and English');
+    check(parseReminders('1日 09:00, 前7日晚上8點', true).join() === '8880,900' && parseReminders('1日 8pm', true).join() === '240' && parseReminders('3日 9點半', true).join() === '3750', 'All-day reminders: days before and a time');
+    check(parseReminders('', false).length === 0 && parseReminders('冇', true).length === 0, 'Empty means no reminder');
+    let threw = 0;
+    for (const [text, allDay] of [['聽日', false], ['5星期', false], ['1日', true], ['0日 09:00', true], ['30日', false], ['1日,2日,3日,4日,5日,6日', false]]) { try { parseReminders(text, allDay); } catch { threw++; } }
+    check(threw === 6, 'Unclear or out-of-range reminders are refused with a message');
+    check(formatReminders([1440, 120], false) === '1日, 2個鐘' && formatReminders([900, 8880], true) === '1日 09:00, 7日 20:00' && parseReminders(formatReminders([1530, 45], false), false).join() === '1530,45', 'Edit box text round-trips');
+    check(describeReminders([900], true, true) === '前1日 09:00' && describeReminders([], false, true) === '唔提醒', 'Reminders described for people');
+
+    // ---- /calendar: category settings and editing items ----
+    const formReply = (custom_id, values, embeds) => interact({ type: 5, data: { custom_id, components: Object.entries(values).map(([id, value]) => ({ type: 1, components: [{ type: 4, custom_id: id, value }] })) }, message: { embeds } });
+    let d = await interact({ type: 2, data: { name: 'calendar' } });
+    const settingsEmbeds = d.data.embeds;
+    check(d.type === 4 && d.data.flags === 64 && settingsEmbeds[0].description.includes('Agent · 生日') && settingsEmbeds[0].description.includes('前1日 09:00'), '/calendar shows each category with its icon and reminders');
+    d = await interact({ type: 3, data: { custom_id: 'cal:pick', component_type: 3, values: ['study'] }, message: { embeds: settingsEmbeds } });
+    const fields = Object.fromEntries(d.data.components.map(r => [r.components[0].custom_id, r.components[0].value]));
+    check(d.type === 9 && d.data.custom_id === 'cal:save:study' && fields.icon === '⏰' && fields.timed === '1日, 2個鐘' && fields.allday === '1日 09:00', 'Picking a category opens a form filled with its settings');
+    d = await formReply('cal:save:study', { icon: '📚', timed: '3日, 1個鐘', allday: '2日 20:00' }, settingsEmbeds);
+    check(d.type === 7 && JSON.parse(db.settings.get('cat:study')).timed.join() === '4320,60' && d.data.content.includes('✅'), 'Category settings saved and the screen updates in place');
+    d = await formReply('cal:save:study', { icon: '📚', timed: '聽日', allday: '' }, settingsEmbeds);
+    check(d.type === 7 && d.data.content.includes('⚠️') && JSON.parse(db.settings.get('cat:study')).timed.join() === '4320,60', 'Bad reminder text is explained and nothing changes');
+    aiReply = JSON.stringify({ items: [{ title: '交 Lab', due_date: friday, due_time: '18:00', notes: '', category: 'study' }] });
+    db.limits.clear(); calls.length = 0;
+    r = await post('/api/siri', { note: '星期五六點交 Lab' }, siriKey);
+    const labEvent = JSON.parse(calls.find(c => c.options.method === 'POST' && c.url.includes('/events')).options.body);
+    check(labEvent.summary === '📚 交 Lab' && labEvent.reminders.overrides.map(o => o.minutes).join() === '4320,60' && r.data.answer.includes('前3日、前1個鐘'), 'New items use the category icon and reminders');
+    const lab = db.tasks.at(-1);
+
+    d = await interact({ type: 3, data: { custom_id: 'cal:upcoming', component_type: 2 }, message: { embeds: settingsEmbeds } });
+    const upcomingEmbeds = d.data.embeds;
+    check(d.type === 7 && upcomingEmbeds[0].description.includes('交 Lab') && d.data.components[0].components[0].options.some(o => o.value === String(lab.id)), 'Upcoming list shows items to pick');
+    d = await interact({ type: 3, data: { custom_id: 'cal:item', component_type: 3, values: [String(lab.id)] }, message: { embeds: upcomingEmbeds } });
+    check(d.type === 9 && d.data.components[1].components[0].value === '3日, 1個鐘', 'Picking an item opens a form with its reminders');
+    calls.length = 0;
+    d = await formReply(`cal:edit:${lab.id}`, { title: '交 Lab 報告', reminders: '1日, 30分鐘' }, upcomingEmbeds);
+    const patch = calls.find(c => c.options.method === 'PATCH' && c.url.includes('/events/'));
+    const patched = JSON.parse(patch.options.body);
+    check(d.type === 6 && patch.url.includes(encodeURIComponent('cal-功課@group.calendar.google.com')) && patched.summary === '📚 交 Lab 報告' && patched.reminders.overrides.map(o => o.minutes).join() === '1440,30', 'Editing an item updates Google Calendar');
+    check(db.tasks.at(-1).title === '交 Lab 報告' && JSON.parse(lastEditBody()).content.includes('✅'), 'Edit saved and the list refreshed');
+    d = await interact({ type: 3, data: { custom_id: 'cal:reset', component_type: 2 }, message: { embeds: settingsEmbeds } });
+    check(!db.settings.has('cat:study') && d.type === 7, 'Reset brings back the default settings');
+    d = await interact({ type: 3, data: { custom_id: 'cal:settings', component_type: 2 }, message: { embeds: [{ title: 'Pocket Agent control panel' }] } });
+    check(d.type === 4 && d.data.flags === 64, 'From /panel the calendar screen opens as a new private message');
+    db.tasks.at(-1).status = 'cancelled'; db.limits.clear();
+
     // ---- Discord: cancel button, /todo, morning summary ----
     calls.length = 0;
-    let d = await interact({ type: 3, data: { custom_id: 'task:cancel:1', component_type: 2 }, message: { content: 'card' } });
+    d = await interact({ type: 3, data: { custom_id: 'task:cancel:1', component_type: 2 }, message: { content: 'card' } });
     const removed = calls.find(c => c.options.method === 'DELETE');
     const edited = JSON.parse(calls.find(c => c.url.endsWith('/messages/@original')).options.body);
     check(d.type === 6 && removed.url.includes(encodeURIComponent('cal-功課@group.calendar.google.com')) && removed.url.endsWith('/events/event-1') && db.tasks[0].status === 'cancelled', 'Cancel removes the calendar event');

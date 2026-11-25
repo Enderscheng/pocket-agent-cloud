@@ -4,6 +4,7 @@
 // is a private guide to the whole system.
 // No calendar, Google account, notes or voice-key access is reachable from here.
 import { answerText } from './voice.js';
+import { calendarInteraction, settingsMessage } from './calendar-ui.js';
 import { cancelTask, agendaMarkdown, ensureTaskTables, describeDue, isChinese, TaskError } from './tasks.js';
 const API = 'https://discord.com/api/v10';
 const DEFAULT_GEMINI_MODEL = 'gemini-flash-latest';
@@ -37,6 +38,8 @@ export const COMMANDS = [{
   name: 'panel', type: 1, description: 'Open the Pocket Agent control panel (models, usage, Siri)',
 }, {
   name: 'todo', type: 1, description: 'Show deadlines and to-dos for the next 14 days',
+}, {
+  name: 'calendar', type: 1, description: 'Calendar settings: icons, reminders, and editing upcoming items',
 }, {
   name: 'help', type: 1, description: 'How Pocket Agent works: every command, button and iPhone shortcut',
 }];
@@ -422,7 +425,7 @@ async function cancelFromButton(env, interaction) {
 }
 
 // ---- /panel: one private message with menus and buttons ----
-async function editOriginal(env, token, payload) {
+export async function editOriginal(env, token, payload) {
   try {
     await fetch(`${API}/webhooks/${env.DISCORD_APPLICATION_ID}/${token}/messages/@original`, {
       method: 'PATCH', signal: AbortSignal.timeout(10000), headers: { 'Content-Type': 'application/json' },
@@ -463,6 +466,10 @@ export async function panelMessage(env, note = '') {
     { type: 2, style: 4, custom_id: 'panel:reset', label: 'Reset models' },
     { type: 2, style: 5, url: LIMITS_URL, label: 'Quota on Google' },
     { type: 2, style: 2, custom_id: 'help:home', label: 'Help', emoji: { name: '❓' } },
+  ] });
+  components.push({ type: 1, components: [
+    { type: 2, style: 1, custom_id: 'cal:settings', label: '日曆設定（icon、提醒）', emoji: { name: '📅' } },
+    { type: 2, style: 2, custom_id: 'cal:upcoming', label: '改即將活動', emoji: { name: '🗓️' } },
   ] });
   return { content: note, embeds: [embed], components };
 }
@@ -518,6 +525,7 @@ const HELP_PAGES = {
     '`/help` — 呢份說明',
     '`/ask question: …` — 問 Gemini。加 `web: True` 會先上 Google 搵資料，答案會列出來源',
     '`/todo` — 未來 14 日嘅 deadline 同要做嘅嘢',
+    '`/calendar` — 日曆設定：每個分類標題前面嘅 icon、預設幾時提醒；仲可以逐項改即將活動嘅名同提醒',
     '`/panel` — 控制台（見下面）',
     '`/usage` — 今日用咗幾多次 AI',
     '`/model show` / `list` / `set name:…` / `reset` — 睇／揀／重設 Gemini 模型',
@@ -529,6 +537,7 @@ const HELP_PAGES = {
     '• **Reset models** — 返回預設模型',
     '• **Quota on Google** — 去 Google 睇免費額度仲剩幾多',
     '• ❓ **Help** — 開呢份說明',
+    '• 📅 **日曆設定** / 🗓️ **改即將活動** — 同 /calendar 一樣',
     '',
     '**頻道入面嘅訊息**',
     '🎙️ Siri 問答　📌 記低　📬 郵件 deadline　☀️ 每朝摘要',
@@ -571,6 +580,7 @@ const HELP_PAGES = {
     '舊嘅黃色 **Agent** 日曆保留舊活動。',
     '想改顏色或者收埋某個分類：iPhone 日曆 App → 最底 **日曆（Calendars）** → 撳分類旁邊嘅 ⓘ → **顏色（Color）**；剔走就唔顯示。',
     '自己手動加活動時，都可以喺 **日曆（Calendar）** 嗰欄揀呢啲分類。',
+    '**改 icon 同提醒**：/calendar（或者 /panel → 📅 日曆設定）。已經加咗嘅活動：/calendar → 🗓️ 改即將活動。',
     '',
     '**每朝摘要** ☀️：每日 06:00 UTC 自動貼未來 7 日要做嘅嘢。',
     '',
@@ -617,7 +627,7 @@ export async function discordInteraction(request, env, ctx) {
     let interaction;
     try { interaction = JSON.parse(body); } catch { throw new DiscordError('Invalid JSON.'); }
     if (interaction.type === 1) return json({ type: 1 });
-    if (![2, 3, 4].includes(interaction.type)) return json({ error: 'Unsupported interaction.' }, 400);
+    if (![2, 3, 4, 5].includes(interaction.type)) return json({ error: 'Unsupported interaction.' }, 400);
     if (String(interaction.application_id) !== String(env.DISCORD_APPLICATION_ID)) return json({ error: 'Wrong application.' }, 400);
     const userId = interaction.member?.user?.id ?? interaction.user?.id;
     const owner = (env.DISCORD_ALLOWED_USER_ID || '').trim();
@@ -633,6 +643,9 @@ export async function discordInteraction(request, env, ctx) {
       ctx.waitUntil(cancelFromButton(env, interaction));
       return json({ type: 6 });
     }
+    if ((interaction.type === 3 || interaction.type === 5) && /^cal:[\w:]{1,40}$/.test(interaction.data?.custom_id || ''))
+      return calendarInteraction(env, ctx, interaction);
+    if (interaction.type === 5) return ephemeral('This form is out of date. Open /calendar again.');
     const helpPage = /^help:(\w{1,20})$/.exec(interaction.data?.custom_id || '')?.[1];
     if (interaction.type === 3 && helpPage) {
       // From /help, switch the page in place; from /panel, open the guide as a new private message.
@@ -645,13 +658,14 @@ export async function discordInteraction(request, env, ctx) {
       ctx.waitUntil(panelUpdate(env, interaction.token, () => panelAction(env, interaction)));
       return json({ type: 6 });
     }
-    if (!['ask', 'model', 'usage', 'panel', 'todo', 'help'].includes(name)) return ephemeral('Unknown command. Re-register commands from the setup page.');
+    if (!['ask', 'model', 'usage', 'panel', 'todo', 'help', 'calendar'].includes(name)) return ephemeral('Unknown command. Re-register commands from the setup page.');
     if (name === 'todo') {
-      ctx.waitUntil(privateFollowUp(env, interaction, async () => `**未來 14 日要做嘅嘢**\n${await agendaMarkdown(env, 14)}\n-# 要取消，撳返嗰項通知下面嘅「取消」掣。`));
+      ctx.waitUntil(privateFollowUp(env, interaction, async () => `**未來 14 日要做嘅嘢**\n${await agendaMarkdown(env, 14)}\n-# 要取消，撳返嗰項通知下面嘅「取消」掣。要改名或者改提醒：/calendar → 改即將活動。`));
       return DEFER_PRIVATE();
     }
     if (name === 'panel') { ctx.waitUntil(panelUpdate(env, interaction.token, () => panelMessage(env))); return DEFER_PRIVATE(); }
     if (name === 'help') return json({ type: 4, data: helpMessage() });
+    if (name === 'calendar') return json({ type: 4, data: await settingsMessage(env) });
     if (name === 'usage') return ephemeral(await usageReport(env));
     if (name === 'model') {
       const sub = interaction.data.options?.[0];

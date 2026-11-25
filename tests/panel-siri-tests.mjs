@@ -122,7 +122,7 @@ export async function runPanelSiriTests(worker) {
     check(!db.settings.has('model') && db.settings.get('siri_channel') === channel, 'Reset clears models but keeps the Siri channel');
 
     // ---- /help ----
-    check(buttons.some(b => b.custom_id === 'help:home') && buttons.length <= 5, 'Panel has a Help button and stays within 5 buttons a row');
+    check(buttons.some(b => b.custom_id === 'help:home') && buttons.some(b => b.custom_id === 'cal:settings') && panel.components.length <= 5 && panel.components.every(row => row.components.length <= 5), 'Panel has Help and calendar buttons and stays within Discord limits');
     r = await interact({ type: 2, data: { name: 'help' } });
     const pages = r.data.components[0].components;
     check(r.type === 4 && r.data.flags === 64 && r.data.embeds[0].title.includes('使用說明'), '/help replies privately with the overview');

@@ -14,7 +14,7 @@ const TABLES = [
   'CREATE TABLE IF NOT EXISTS agent_calendars (category TEXT PRIMARY KEY, calendar_id TEXT NOT NULL)',
 ];
 // Columns added after the first version; adding them again fails harmlessly.
-const NEW_COLUMNS = ['ALTER TABLE tasks ADD COLUMN category TEXT', 'ALTER TABLE tasks ADD COLUMN calendar_id TEXT'];
+const NEW_COLUMNS = ['ALTER TABLE tasks ADD COLUMN category TEXT', 'ALTER TABLE tasks ADD COLUMN calendar_id TEXT', 'ALTER TABLE tasks ADD COLUMN reminders TEXT'];
 // One calendar per category, created the first time it is needed. Colours are Google's palette.
 export const CATEGORIES = {
   study: { zh: '功課', en: 'Study', emoji: '📚', color: '#4285f4' },
@@ -132,25 +132,116 @@ async function calendarLink(env) {
   return link;
 }
 const EVENT_MINUTES = 60;
-export function eventBody(item, source, zone) {
+// ---- Per-category settings (icon and default reminders), edited from Discord ----
+// Reminders are minutes before the start. For all-day items the start is midnight, so
+// 900 means 09:00 the day before.
+export const DEFAULT_TIMED = [1440, 120];
+export const DEFAULT_ALLDAY = [900];
+const MAX_REMINDERS = 5, MAX_MINUTES = 40320;
+export function defaultSettings(key) {
+  return { icon: key === 'birthday' ? '🎂' : '⏰', timed: [...DEFAULT_TIMED], allday: [...DEFAULT_ALLDAY] };
+}
+const validList = list => Array.isArray(list) && list.length <= MAX_REMINDERS && list.every(n => Number.isInteger(n) && n >= 0 && n <= MAX_MINUTES);
+export async function categorySettings(env, key) {
+  const fallback = defaultSettings(key);
+  if (!CATEGORIES[key]) return fallback;
+  let saved = null;
+  try {
+    const row = await db(env).prepare('SELECT value FROM discord_settings WHERE key = ?').bind('cat:' + key).first();
+    saved = row ? JSON.parse(row.value) : null;
+  } catch { /* table missing or bad value: use defaults */ }
+  return {
+    icon: typeof saved?.icon === 'string' ? saved.icon : fallback.icon,
+    timed: validList(saved?.timed) ? saved.timed : fallback.timed,
+    allday: validList(saved?.allday) ? saved.allday : fallback.allday,
+  };
+}
+export function cleanIcon(text) {
+  const icon = String(text ?? '').replace(/[\u0000-\u001f\u007f*_`~|>\\]/g, '').trim();
+  if (icon.length > 16) throw new TaskError('Icon 太長，最多 16 個字元，例如一個 emoji。');
+  return icon;
+}
+export async function saveCategorySettings(env, key, settings) {
+  if (!CATEGORIES[key]) throw new TaskError('冇呢個分類。');
+  await db(env).prepare('INSERT INTO discord_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+    .bind('cat:' + key, JSON.stringify({ icon: cleanIcon(settings.icon), timed: settings.timed, allday: settings.allday })).run();
+}
+export async function resetCategorySettings(env) {
+  for (const key of Object.keys(CATEGORIES)) await db(env).prepare('DELETE FROM discord_settings WHERE key = ?').bind('cat:' + key).run();
+}
+// Reminders for one item: its own if it was edited, otherwise what it was created with.
+export function taskReminders(task) {
+  try { const list = JSON.parse(task.reminders || 'null'); if (validList(list)) return list; } catch { /* fall through */ }
+  return task.due_time ? [...DEFAULT_TIMED] : [...DEFAULT_ALLDAY];
+}
+
+// "1日, 2個鐘" (timed) or "1日 09:00, 3日 20:00" (all-day) ↔ minutes.
+const UNIT = u => /^(日|天|d)/i.test(u) ? 1440 : /^(小時|個鐘|鐘|h)/i.test(u) ? 60 : 1;
+export function parseReminders(text, allDay) {
+  const raw = String(text ?? '').trim();
+  if (!raw || /^(冇|無|没有|沒有|唔使|none|no)$/i.test(raw)) return [];
+  const parts = raw.split(/[,，、;；\n]+/).map(s => s.trim()).filter(Boolean);
+  if (parts.length > MAX_REMINDERS) throw new TaskError(`最多 ${MAX_REMINDERS} 個提醒。`);
+  const out = [];
+  for (const part of parts) {
+    let minutes;
+    if (allDay) {
+      const day = /(\d{1,2})\s*(日|天|days?|d)(?![a-z])/i.exec(part);
+      const time = /(\d{1,2})\s*[:：]\s*(\d{2})/.exec(part) || /(\d{1,2})\s*點\s*(半)?/.exec(part) || /(\d{1,2})\s*(?=am|pm)/i.exec(part);
+      if (!time) throw new TaskError(`「${part}」唔明。全日活動要寫「前幾日 幾點」，例如「1日 09:00」。`);
+      const days = day ? Number(day[1]) : 1;
+      let h = Number(time[1]);
+      const m = time[2] === '半' ? 30 : Number(time[2] || 0);
+      if (/(下午|晏晝|晚上|夜晚|夜|pm)/i.test(part) && h < 12) h += 12;
+      if (/(凌晨|am)/i.test(part) && h === 12) h = 0;
+      if (days < 1 || h > 23 || m > 59) throw new TaskError(`「${part}」唔啱。最少要前 1 日，時間 00:00 至 23:59。`);
+      minutes = days * 1440 - (h * 60 + m);
+    } else {
+      const re = /(\d+(?:\.\d+)?)\s*(日|天|days?|d|小時|個鐘頭|個鐘|鐘頭|鐘|hours?|hrs?|h|分鐘|分|minutes?|mins?|m)(?![a-z])/gi;
+      let match, total = 0, found = false;
+      while ((match = re.exec(part))) { found = true; total += Number(match[1]) * UNIT(match[2]); }
+      if (!found) throw new TaskError(`「${part}」唔明。例如「1日」「2個鐘」「30分鐘」。`);
+      minutes = Math.round(total);
+    }
+    if (!(minutes >= 0 && minutes <= MAX_MINUTES)) throw new TaskError('提醒最早只可以提前 4 個星期。');
+    out.push(minutes);
+  }
+  return [...new Set(out)].sort((a, b) => b - a);
+}
+const pad = n => String(n).padStart(2, '0');
+function oneReminder(minutes, allDay, chinese) {
+  if (allDay) {
+    const days = Math.max(1, Math.ceil(minutes / 1440)), at = days * 1440 - minutes;
+    const time = `${pad(Math.floor(at / 60))}:${pad(at % 60)}`;
+    return chinese ? `${days}日 ${time}` : `${days} day${days > 1 ? 's' : ''} before at ${time}`;
+  }
+  if (minutes === 0) return chinese ? '0分鐘' : 'at the start';
+  const d = Math.floor(minutes / 1440), h = Math.floor(minutes % 1440 / 60), m = minutes % 60;
+  if (chinese) return `${d ? d + '日' : ''}${h ? h + '個鐘' : ''}${m ? m + '分鐘' : ''}`;
+  return [d && `${d} day${d > 1 ? 's' : ''}`, h && `${h} hour${h > 1 ? 's' : ''}`, m && `${m} min`].filter(Boolean).join(' ') + ' before';
+}
+// Text for the edit box: the same form parseReminders reads.
+export const formatReminders = (list, allDay) => list.map(n => oneReminder(n, allDay, true)).join(', ');
+// Text for people: "前1日 09:00、前2個鐘".
+export function describeReminders(list, allDay, chinese) {
+  if (!list.length) return chinese ? '唔提醒' : 'no reminder';
+  return list.map(n => (chinese ? '前' : '') + oneReminder(n, allDay, chinese)).join(chinese ? '、' : ', ');
+}
+
+export function eventBody(item, source, zone, prefs = defaultSettings(item.category)) {
   const label = { siri: 'Siri', gmail: 'Gmail', outlook: 'Outlook' }[source] || source;
   const description = `${item.notes ? item.notes + '\n\n' : ''}— Pocket Agent (${label})`;
-  if (item.category === 'birthday' && !item.due_time) {
-    // Birthdays repeat every year, with a reminder at 09:00 the day before.
-    return { summary: `🎂 ${item.title}`, description, start: { date: item.due_date }, end: { date: addDays(item.due_date, 1) },
-      recurrence: ['RRULE:FREQ=YEARLY'], reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 900 }] } };
-  }
+  const summary = `${prefs.icon ? prefs.icon + ' ' : ''}${item.title}`;
+  const reminders = { useDefault: false, overrides: (item.due_time ? prefs.timed : prefs.allday).map(minutes => ({ method: 'popup', minutes })) };
   if (item.due_time) {
     const [y, m, d] = item.due_date.split('-').map(Number), [h, min] = item.due_time.split(':').map(Number);
     // One hour long so the event is easy to see in the calendar; it starts at the stated time.
     const endAt = new Date(Date.UTC(y, m - 1, d, h, min + EVENT_MINUTES)).toISOString().slice(0, 19);
-    return { summary: `⏰ ${item.title}`, description,
-      start: { dateTime: `${item.due_date}T${item.due_time}:00`, timeZone: zone }, end: { dateTime: endAt, timeZone: zone },
-      reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 1440 }, { method: 'popup', minutes: 120 }] } };
+    return { summary, description, start: { dateTime: `${item.due_date}T${item.due_time}:00`, timeZone: zone }, end: { dateTime: endAt, timeZone: zone }, reminders };
   }
-  // All-day: remind at 09:00 the day before (15 hours before midnight).
-  return { summary: `⏰ ${item.title}`, description, start: { date: item.due_date }, end: { date: addDays(item.due_date, 1) },
-    reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 900 }] } };
+  // Birthdays repeat every year.
+  return { summary, description, start: { date: item.due_date }, end: { date: addDays(item.due_date, 1) }, reminders,
+    ...(item.category === 'birthday' ? { recurrence: ['RRULE:FREQ=YEARLY'] } : {}) };
 }
 async function googleFetch(token, url, options = {}) {
   try {
@@ -186,11 +277,12 @@ async function categoryCalendar(env, link, token, key) {
   } catch { /* ignore */ }
   return id;
 }
-export async function createEvent(env, item, source) {
+export async function createEvent(env, item, source, prefs) {
+  prefs ||= await categorySettings(env, item.category);
   const link = await calendarLink(env);
   const token = await accessToken(env, link);
   const calendarId = await categoryCalendar(env, link, token, item.category);
-  const response = await googleFetch(token, eventsUrl(calendarId), { method: 'POST', body: JSON.stringify(eventBody(item, source, timeZone(env))) });
+  const response = await googleFetch(token, eventsUrl(calendarId), { method: 'POST', body: JSON.stringify(eventBody(item, source, timeZone(env), prefs)) });
   // Never include Google's response body: it can echo request details.
   if (!response.ok) throw new TaskError(`Google Calendar returned HTTP ${response.status}. If access expired, reconnect Google on the setup page.`, 502);
   return { eventId: (await response.json()).id || null, calendarId };
@@ -223,15 +315,17 @@ export function describeDue(item, chinese) {
   return `${WEEK_EN[day]} ${d} ${MONTH_EN[m - 1]}${item.due_time ? ', ' + item.due_time : ''}`;
 }
 function reminderText(item, chinese) {
-  if (chinese) return item.due_time ? '會喺前一日同前兩個鐘提你' : '會喺前一日朝早 9 點提你';
-  return item.due_time ? "I'll remind you a day and two hours before" : "I'll remind you at 9:00 the day before";
+  const list = taskReminders(item), yearly = item.category === 'birthday' && !item.due_time;
+  if (!list.length) return chinese ? '唔會提你' : "I won't remind you";
+  const when = describeReminders(list, !item.due_time, chinese);
+  return chinese ? `${yearly ? '每年都' : ''}會喺${when}提你` : `I'll remind you ${when}${yearly ? ', every year' : ''}`;
 }
 function discordCard(task, heading, chinese, extra = '') {
   const lines = [`${heading}`, `**${task.title}**`, `🗓️ ${describeDue(task, chinese)}`];
   if (task.notes) lines.push(`📝 ${task.notes}`);
   if (extra) lines.push(extra);
   const where = category(task.category) ? `${chinese ? '' : 'the '}${category(task.category).emoji} ${calendarName(task.category)}` : 'Agent';
-  const reminder = task.category === 'birthday' && !task.due_time ? (chinese ? '每年都會喺前一日朝早 9 點提你' : "I'll remind you at 9:00 the day before, every year") : reminderText(task, chinese);
+  const reminder = reminderText(task, chinese);
   lines.push(task.event_id ? `-# ${chinese ? `已加入 ${where} 日曆，` : `Added to ${where} calendar. `}${reminder}`
     : `-# ${chinese ? '⚠️ 未能加入日曆，只係記錄喺 Pocket Agent' : '⚠️ Not added to the calendar; saved in Pocket Agent only'}`);
   return lines.join('\n');
@@ -242,10 +336,12 @@ const cancelButton = (id, chinese) => ({ components: [{ type: 1, components: [
 // ---- Saving ----
 async function saveItem(env, ctx, item, source, heading, extra = '') {
   let eventId = null, calendarId = null, problem = null;
-  try { ({ eventId, calendarId } = await createEvent(env, item, source)); } catch (error) { problem = error instanceof TaskError ? error.message : 'Calendar error.'; }
-  const row = await db(env).prepare("INSERT INTO tasks (source, title, due_date, due_time, notes, event_id, status, created_at, category, calendar_id) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?) RETURNING id")
-    .bind(source, item.title, item.due_date, item.due_time, item.notes, eventId, new Date().toISOString(), item.category || null, calendarId).first();
-  const task = { ...item, id: row.id, event_id: eventId };
+  const prefs = await categorySettings(env, item.category);
+  const reminders = JSON.stringify(item.due_time ? prefs.timed : prefs.allday);
+  try { ({ eventId, calendarId } = await createEvent(env, item, source, prefs)); } catch (error) { problem = error instanceof TaskError ? error.message : 'Calendar error.'; }
+  const row = await db(env).prepare("INSERT INTO tasks (source, title, due_date, due_time, notes, event_id, status, created_at, category, calendar_id, reminders) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) RETURNING id")
+    .bind(source, item.title, item.due_date, item.due_time, item.notes, eventId, new Date().toISOString(), item.category || null, calendarId, reminders).first();
+  const task = { ...item, id: row.id, event_id: eventId, reminders };
   const channel = await siriChannel(env);
   if (channel) {
     const chinese = isChinese(item.title + item.notes);
@@ -302,7 +398,7 @@ export async function upcomingTasks(env, days = 7) {
   const database_ = db(env);
   await ensureTaskTables(database_);
   const today = localNow(timeZone(env)).date;
-  return (await database_.prepare("SELECT id, source, title, due_date, due_time, notes, event_id, category FROM tasks WHERE status = 'active' AND due_date >= ? AND due_date <= ? ORDER BY due_date, due_time IS NULL, due_time LIMIT 25")
+  return (await database_.prepare("SELECT id, source, title, due_date, due_time, notes, event_id, category, reminders FROM tasks WHERE status = 'active' AND due_date >= ? AND due_date <= ? ORDER BY due_date, due_time IS NULL, due_time LIMIT 25")
     .bind(today, addDays(today, days)).all()).results || [];
 }
 export async function agendaText(env, chinese = true, days = 7) {
@@ -321,6 +417,29 @@ export async function dailyDigest(env) {
   const channel = await siriChannel(env);
   if (!channel) return false;
   return postToChannel(env, channel, `☀️ **早晨！今日同未來 7 日要做嘅嘢**\n${await agendaMarkdown(env)}\n-# 🔴 今日 · 🟠 聽日 · ⚠️ 未加入日曆`);
+}
+export async function getTask(env, id) {
+  const database_ = db(env);
+  await ensureTaskTables(database_);
+  return database_.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first();
+}
+// Change an item's title and reminders, in Pocket Agent and in Google Calendar.
+export async function editTask(env, id, { title, reminders }) {
+  const task = await getTask(env, id);
+  if (!task || task.status !== 'active') throw new TaskError('呢項已經取消咗或者唔存在。', 404);
+  const name = clean(title, 80);
+  if (!name) throw new TaskError('名唔可以留空。');
+  if (task.event_id) {
+    const prefs = await categorySettings(env, task.category);
+    const link = await calendarLink(env);
+    const token = await accessToken(env, link);
+    const response = await googleFetch(token, eventsUrl(task.calendar_id || link.calendar_id, `/${encodeURIComponent(task.event_id)}`), { method: 'PATCH',
+      body: JSON.stringify({ summary: `${prefs.icon ? prefs.icon + ' ' : ''}${name}`, reminders: { useDefault: false, overrides: reminders.map(minutes => ({ method: 'popup', minutes })) } }) });
+    if (response.status === 404 || response.status === 410) throw new TaskError('日曆入面已經搵唔到呢項（可能喺 iPhone 刪咗）。', 404);
+    if (!response.ok) throw new TaskError(`Google Calendar returned HTTP ${response.status}. If access expired, reconnect Google on the setup page.`, 502);
+  }
+  await db(env).prepare('UPDATE tasks SET title = ?, reminders = ? WHERE id = ?').bind(name, JSON.stringify(reminders), id).run();
+  return { ...task, title: name, reminders: JSON.stringify(reminders) };
 }
 export async function cancelTask(env, id) {
   const database_ = db(env);
