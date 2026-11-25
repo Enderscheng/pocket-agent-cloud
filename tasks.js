@@ -115,12 +115,14 @@ async function calendarLink(env) {
   if (!link?.calendar_id) throw new TaskError('Connect Google and create the Agent calendar on the setup page first.', 503);
   return link;
 }
+const EVENT_MINUTES = 60;
 export function eventBody(item, source, zone) {
   const label = { siri: 'Siri', gmail: 'Gmail', outlook: 'Outlook' }[source] || source;
   const description = `${item.notes ? item.notes + '\n\n' : ''}— Pocket Agent (${label})`;
   if (item.due_time) {
     const [y, m, d] = item.due_date.split('-').map(Number), [h, min] = item.due_time.split(':').map(Number);
-    const endAt = new Date(Date.UTC(y, m - 1, d, h, min + 30)).toISOString().slice(0, 19);
+    // One hour long so the event is easy to see in the calendar; it starts at the stated time.
+    const endAt = new Date(Date.UTC(y, m - 1, d, h, min + EVENT_MINUTES)).toISOString().slice(0, 19);
     return { summary: `⏰ ${item.title}`, description,
       start: { dateTime: `${item.due_date}T${item.due_time}:00`, timeZone: zone }, end: { dateTime: endAt, timeZone: zone },
       reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 1440 }, { method: 'popup', minutes: 120 }] } };

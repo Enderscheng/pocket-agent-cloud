@@ -123,7 +123,7 @@ export async function runTaskTests(worker) {
     check(items.length === 2 && items[0].title === 'Submit report' && items[1].due_time === null, 'AI output is validated: bad dates, past dates and empty titles dropped');
     check(parseItems('nonsense', today, { requireOne: true }).length === 0 && parseItems('{"items":[{"title":"Buy milk"}]}', today, { requireOne: true })[0].due_date === today, 'Undated note defaults to today');
     const late = eventBody({ title: 'Late', due_date: '2026-12-31', due_time: '23:45', notes: '' }, 'siri', 'Europe/Copenhagen');
-    check(late.end.dateTime === '2027-01-01T00:15:00' && late.reminders.overrides.map(o => o.minutes).join() === '1440,120', 'Timed event: 30 minutes, reminders a day and 2 hours before');
+    check(late.end.dateTime === '2027-01-01T00:45:00' && late.reminders.overrides.map(o => o.minutes).join() === '1440,120', 'Timed event: 1 hour, reminders a day and 2 hours before');
     const allDay = eventBody({ title: 'All day', due_date: '2026-11-30', due_time: null, notes: '' }, 'gmail', 'Europe/Copenhagen');
     check(allDay.start.date === '2026-11-30' && allDay.end.date === '2026-12-01' && allDay.reminders.overrides[0].minutes === 900, 'All-day event with 09:00 reminder the day before');
     check(describeDue({ due_date: '2026-11-28', due_time: '15:00' }, true) === '11月28日（星期六）下午3:00' && describeDue({ due_date: '2026-11-28', due_time: null }, false) === 'Sat 28 Nov', 'Dates described in Cantonese and English');
